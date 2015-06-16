@@ -15,6 +15,7 @@ import re
 import struct
 import bisect
 import logging
+import json
 
 import elftools
 from elftools.elf.elffile import ELFFile
@@ -638,6 +639,9 @@ class Region:
             log.warning("Region.dump called directly (this shouldn't happen).  {!r} - {!r} ({} bytes) will not be represented in output.".format(self.start, self.end, self.end - self.start))
             writer.warning("{} bytes skipped".format(self.end - self.start))
 
+    def get_callmap(self):
+        return None
+
     def __repr__(self):
         return "<{} region at {!r}>".format(self.region_type, self.start.loc_str())
 
@@ -649,6 +653,7 @@ class FunctionRegion (Region):
         Region.__init__(self, start, end)
         self.func_name = func_name
         self.disassembly = None
+        self.call_targets = []
 
     def code_analysis(self):
         if self.disassembly is not None:
@@ -991,6 +996,7 @@ class FunctionRegion (Region):
                         addr.section.register_entry_point(addr, called_from=opcode.addr)
                     else:
                         debug(3, "{!r}: call destination ({!r}) not local.  Not annotating.".format(opcode.addr, addr))
+                    self.call_targets.append((opcode.addr, addr))
                 else:
                     debug(3, "{!r}: call destination ({}) value unknown.  No action taken.".format(opcode.addr, opcode.args[0]))
             elif opcode_type == 'branch':
@@ -1056,6 +1062,9 @@ class FunctionRegion (Region):
         for opcode in self.disassembly:
             writer.opcode(opcode)
         writer.spacer_line()
+
+    def get_callmap(self):
+        return self.call_targets
 
 
 class DataRegion (Region):
@@ -1579,6 +1588,13 @@ class Section:
             r.dump(writer)
         writer.end_section()
 
+    def get_callmap(self):
+        result = {}
+        for r in self.regions.values():
+            m = r.get_callmap()
+            if m is not None:
+                result[r] = m
+        return result
 
 class CodeSection (Section):
     sh_type = 'SHT_PROGBITS'
@@ -1854,6 +1870,12 @@ class ObjectFile:
             section.dump(writer)
         writer.end_file()
 
+    def get_callmap(self):
+        results = {}
+        for section in self.sections.values():
+            results[section] = section.get_callmap()
+        return results
+
     def disassemble(self, start, end=None):
         return self.disassembler.disassemble(self.filename, start, end)
 
@@ -2027,6 +2049,8 @@ def load_elf_data(objfile, elf):
 
 def load_elf_annotations(objfile, elf):
     for sym in objfile.symbols.values():
+        if sym.section:
+            sym.section.annotate(sym, 'symbol', sym.name)
         if sym.section and sym.type != 'STT_SECTION':
             debug(1, "Adding label for symbol at {!r}".format(sym))
             sym.section.add_label(sym, sym.name)
@@ -2265,6 +2289,26 @@ def print_elf_format_error(args, f):
         info(0, "     link them all together into a single .o as well)")
 
 
+def write_callmap(objfile, filename):
+    result = {}
+    for section, funcs in objfile.get_callmap().items():
+        section_info = {}
+        for f, targets in funcs.items():
+            func_name = str(f.start)
+            func_offset = f.start.offset
+            is_sym = bool(section.annotations.get(f.start, {}).get('symbol'))
+            calls = []
+            for src, dst in targets:
+                calls.append({'opcode_offset': src.offset - func_offset, 'target': str(dst)})
+            funcdata = {'offset': func_offset, 'global_name': is_sym, 'calls': calls}
+            section_info[func_name] = funcdata
+        if section_info:
+            result[section.name] = section_info
+    callmap = {'filename': objfile.filename, 'functions': result}
+    with open(filename, 'w') as f:
+        json.dump(callmap, f, sort_keys=True, indent=4)
+
+
 if __name__ == '__main__':
     h = logging.StreamHandler()
     h.setFormatter(SimpleFormatter())
@@ -2284,6 +2328,7 @@ if __name__ == '__main__':
                        help='Do not print hex-dump comments on each line')
     parser.add_argument('--noopnotes', action='store_true',
                        help='Do not print comments about opcode arguments')
+    parser.add_argument('--callmap', metavar='MAPFILE', type=str, help='Write call-map data to MAPFILE')
     parser.add_argument('--objdump', metavar='CMD', type=str, help='Full pathname of the objdump command to use')
 
     args = parser.parse_args()
@@ -2354,6 +2399,9 @@ if __name__ == '__main__':
             objfile.fixup()
             debug(1, "=== Analysis complete.")
             dw.dump(objfile)
+            if args.callmap:
+                debug(1, "=== Writing callmap...")
+                write_callmap(objfile, args.callmap)
         except BrokenPipeError:
             pass
         except XtobjdisException as e:
