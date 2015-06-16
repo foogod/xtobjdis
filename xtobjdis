@@ -1991,22 +1991,23 @@ def load_elf_data(objfile, elf):
             objfile.add_section(section)
     symtab = elf.get_section_by_name(b'.symtab')
     if not symtab:
-        raise NoSymTabException("File has no symbol table section ('.symtab')")
-    debug(1, "Processing symtab: {} symbols found".format(symtab.num_symbols()))
-    for index in range(symtab.num_symbols()):
-        elf_sym = symtab.get_symbol(index)
-        name = bytes2str(elf_sym.name)
-        debug(2, "Symbol {}: {!r} (section={}, type={}, value=0x{:08x})".format(index, name, elf_sym.entry['st_shndx'], elf_sym.entry['st_info']['type'], elf_sym.entry['st_value']))
-        if elf_sym.entry['st_shndx'] == 'SHN_UNDEF':
-            section = None
-        else:
-            section = objfile.get_section(elf_sym.entry['st_shndx'])
-            if not name and section:
-                name = section.name
-        offset = elf_sym.entry['st_value']
-        sym = Symbol(section, offset, name)
-        sym.type = elf_sym.entry['st_info']['type']
-        objfile.symbols[index] = sym
+        log.warning("File has no symbol table section ('.symtab').")
+    else:
+        debug(1, "Processing symtab: {} symbols found".format(symtab.num_symbols()))
+        for index in range(symtab.num_symbols()):
+            elf_sym = symtab.get_symbol(index)
+            name = bytes2str(elf_sym.name)
+            debug(2, "Symbol {}: {!r} (section={}, type={}, value=0x{:08x})".format(index, name, elf_sym.entry['st_shndx'], elf_sym.entry['st_info']['type'], elf_sym.entry['st_value']))
+            if elf_sym.entry['st_shndx'] == 'SHN_UNDEF':
+                section = None
+            else:
+                section = objfile.get_section(elf_sym.entry['st_shndx'])
+                if not name and section:
+                    name = section.name
+            offset = elf_sym.entry['st_value']
+            sym = Symbol(section, offset, name)
+            sym.type = elf_sym.entry['st_info']['type']
+            objfile.symbols[index] = sym
     for elf_section in elf.iter_sections():
         if elf_section.header.sh_type in ('SHT_REL', 'SHT_RELA'):
             rel_section_name = bytes2str(elf_section.name)
