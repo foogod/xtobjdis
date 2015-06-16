@@ -231,14 +231,20 @@ OPCODE_INFO = {
 OPCODES_ILLEGAL = ('ill', '.byte')
 
 OPCODE_ACCESS_WIDTH = {
-    'l8ui':  'byte',
-    'l16si': 'hword',
-    'l16ui': 'hword',
-    'l32i':  'word',
-    'l32r':  'word',
-    's8i':   'byte',
-    's16i':  'hword',
-    's32i':  'word',
+    'l8ui':  1,
+    'l16si': 2,
+    'l16ui': 2,
+    'l32i':  4,
+    'l32r':  4,
+    's8i':   1,
+    's16i':  2,
+    's32i':  4,
+}
+
+SIZE_NAMES = {
+    1: 'byte',
+    2: 'hword',
+    4: 'word',
 }
 
 # Minimum number of zero bytes we look for between nonzero sequences to
@@ -400,14 +406,19 @@ class Addr:
 
     def loc_str(self):
         if self.base:
-            if self.offset >= self.base.offset:
-                return '{}+0x{:x}'.format(self.base.name, self.offset - self.base.offset)
-            else:
-                return '{}-0x{:x}'.format(self.base.name, self.base.offset - self.offset)
-        if self.section:
-            return '{}+0x{:x}'.format(self.section.name, self.offset)
+            base_name = self.base.name
+            base_offset = self.base.offset
+        elif self.section:
+            base_name = self.section.name
+            base_offset = 0
         else:
             return '<null symbol>'
+        if self.base and self.offset == base_offset:
+            return base_name
+        elif self.offset >= base_offset:
+            return '{}+0x{:x}'.format(base_name, self.offset - base_offset)
+        else:
+            return '{}-0x{:x}'.format(base_name, base_offset - self.offset)
 
     def target_str(self):
         if self.name:
@@ -795,7 +806,8 @@ class FunctionRegion (Region):
         #TODO: abi/noabi
         # On entry into a function, all we really know is that a1 points to the
         # top of our local stack (frame pointer).
-        disassembly[0].regs = {'a1': RegisterValue('(FP)')}
+        self.stack = StackPseudoSection(self)
+        disassembly[0].regs = {'a1': RegisterValue(Addr(self.stack, 0))}
         repeat_pass = True
         while repeat_pass:
             repeat_pass = False
@@ -1013,8 +1025,34 @@ class FunctionRegion (Region):
         else:
             self.end = self.start
 
+        counter = 0
+        prev_addr = None
+        for addr, note in self.stack.annotations.items():
+            if prev_addr:
+                self.stack.annotate(prev_addr, 'length', addr - prev_addr)
+            self.stack.add_label(addr, '(local{})'.format(counter))
+            counter += 1
+            prev_addr = addr
+        self.stack.add_label(Addr(self.stack, 0), '(top of frame)')
+        if prev_addr:
+            self.stack.annotate(prev_addr, 'length', -prev_addr.offset)
+
     def dump(self, writer):
         writer.spacer_line()
+        if len(self.stack.annotations) > 1:
+            writer.comment('Local variables/stack:')
+            for addr, note in self.stack.annotations.items():
+                # Don't print the entry for offset==0, because that's always
+                # just our "(top of frame)" label.
+                if addr.offset:
+                    label = list(note['label'])[0] + ':'
+                    size = list(note.get('data_size', {-1}))[0]
+                    length = list(note.get('length', {size}))[0]
+                    size_name = SIZE_NAMES.get(size, '???')
+                    count = int(length / size)
+                    if count > 1:
+                        size_name = '{}[{}]'.format(size_name, count)
+                    writer.comment('    {:10} {:9} @ -0x{:x}'.format(label, size_name, -addr.offset))
         for opcode in self.disassembly:
             writer.opcode(opcode)
         writer.spacer_line()
@@ -1235,7 +1273,7 @@ class Section:
             raise ValueError("Attempt to register literal {!r} in section {}".format(addr, self.name))
         self.annotate(addr, 'type', 'data')
         self.annotate(addr, 'ref', 'literal')
-        self.annotate(addr, 'data_size', 'word')
+        self.annotate(addr, 'data_size', 4)
 
     def register_data(self, addr, data_size):
         if not isinstance(addr, Addr) or addr.section is None:
@@ -1356,8 +1394,8 @@ class Section:
 
     def code_analysis(self):
         changed = False
-        for start in self.find_new_code_regions():
-            end = self.find_next_non_code_region(start)
+        for start in self.find_new_function_regions():
+            end = self.find_next_non_function_region(start)
             if end is None:
                 end = Addr(self, len(self.data))
             debug(2, "Found new code region at {!r} - {!r}".format(start, end))
@@ -1376,26 +1414,26 @@ class Section:
                 self.remove_annotation(region.start, 'type', 'code')
         return changed
 
-    def find_new_code_regions(self):
+    def find_new_function_regions(self):
         current_end = Addr(self, 0)
         for addr, notes in list(self.annotations.items()):
-            debug(3, "find_new_code_regions: next note at {!r}".format(addr))
+            debug(3, "find_new_function_regions: next note at {!r}".format(addr))
             if addr < current_end:
-                debug(3, "find_new_code_regions: addr ({!r}) less than current_end ({!r}).  Skipping.".format(addr, current_end))
+                debug(3, "find_new_function_regions: addr ({!r}) less than current_end ({!r}).  Skipping.".format(addr, current_end))
                 continue
             if 'code' in notes.get('type', {}):
-                debug(3, "find_new_code_regions: type=code")
+                debug(3, "find_new_function_regions: type=code")
                 region = self.get_region(addr)
                 if isinstance(region, FunctionRegion):
-                    debug(3, "find_new_code_regions: FunctionRegion from {!r} to {!r} already exists.  Skipping.".format(region.start, region.end))
+                    debug(3, "find_new_function_regions: FunctionRegion from {!r} to {!r} already exists.  Skipping.".format(region.start, region.end))
                     current_end = region.end
                     continue
-                debug(3, "find_new_code_regions: returning {!r}".format(addr))
+                debug(3, "find_new_function_regions: returning {!r}".format(addr))
                 yield addr
             else:
-                debug(3, "find_new_code_regions: type!=code")
+                debug(3, "find_new_function_regions: type!=code")
 
-    def find_next_non_code_region(self, start):
+    def find_next_non_function_region(self, start):
         #TODO: is there a more efficient way to do this?
         for addr, notes in self.annotations.items():
             if addr <= start:
@@ -1408,11 +1446,11 @@ class Section:
         for addr in self.find_new_data_regions():
             ann = self.annotations[addr]
             data_size = ann.get('data_size', {})
-            if 'word' in data_size:
+            if 4 in data_size:
                 region = WordDataRegion(addr)
-            elif 'hword' in data_size:
+            elif 2 in data_size:
                 region = HalfWordDataRegion(addr)
-            elif 'byte' in data_size:
+            elif 1 in data_size:
                 region = BytesDataRegion(addr)
             else:
                 # Default to word, but only if we're starting on a 32-bit
@@ -1712,6 +1750,13 @@ class XtLitSection (MetadataSection):
                 addr.section.annotate(addr, 'type', 'data')
                 addr.section.annotate(addr, 'ref', 'literal')
             i += 1
+
+
+class StackPseudoSection (Section):
+    def __init__(self, function_region):
+        objfile = function_region.start.section.objfile
+        Section.__init__(self, objfile, None, '(FP)', b'')
+        self.function_region = function_region
 
 
 class ObjectFile:
