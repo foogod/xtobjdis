@@ -2050,11 +2050,10 @@ def load_elf_data(objfile, elf):
 
 def load_elf_annotations(objfile, elf):
     for sym in objfile.symbols.values():
-        if sym.section:
-            sym.section.annotate(sym, 'symbol', sym.name)
         if sym.section and sym.type != 'STT_SECTION':
             debug(1, "Adding label for symbol at {!r}".format(sym))
             sym.section.add_label(sym, sym.name)
+            sym.section.annotate(sym, 'symbol', sym.name)
         if sym.type == 'STT_FUNC':
             debug(1, "Noting function entry point at {!r}".format(sym))
             sym.section.register_entry_point(sym, name=sym.name)
