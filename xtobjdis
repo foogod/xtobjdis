@@ -1247,6 +1247,9 @@ class Section:
         return ''.join(sorted(f))
 
     def annotate(self, addr, note_type, note_value):
+        if addr.offset > len(self.data):
+            debug(1, "Note: Attempt to annotate {!r}, which is beyond the end of the section. ({}={})  Ignored.".format(addr, note_type, note_value))
+            return
         self.annotations.setdefault(addr, {}).setdefault(note_type, set()).add(note_value)
 
     def remove_annotation(self, addr, note_type, note_value):
@@ -2054,9 +2057,9 @@ def load_elf_annotations(objfile, elf):
             debug(1, "Adding label for symbol at {!r}".format(sym))
             sym.section.add_label(sym, sym.name)
             sym.section.annotate(sym, 'symbol', sym.name)
-        if sym.type == 'STT_FUNC':
-            debug(1, "Noting function entry point at {!r}".format(sym))
-            sym.section.register_entry_point(sym, name=sym.name)
+            if sym.type == 'STT_FUNC':
+                debug(1, "Noting function entry point at {!r}".format(sym))
+                sym.section.register_entry_point(sym, name=sym.name)
     for section in objfile.sections.values():
         if isinstance(section, (XtPropSection, XtLitSection)):
             section.apply_annotations()
