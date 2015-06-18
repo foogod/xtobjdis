@@ -2304,7 +2304,7 @@ def write_callmap(objfile, filename):
             section_info[func_name] = funcdata
         if section_info:
             result[section.name] = section_info
-    callmap = {'filename': objfile.filename, 'functions': result}
+    callmap = [{'filename': objfile.filename, 'functions': result}]
     with open(filename, 'w') as f:
         json.dump(callmap, f, sort_keys=True, indent=4)
 
