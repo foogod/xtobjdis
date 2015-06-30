@@ -285,6 +285,9 @@ if __name__ == '__main__':
     pgroup.add_argument('--nofollow', metavar='FUNCTION', action='append', default=[], help='Do not follow calls from the specified function when processing includes')
     pgroup.add_argument('--nofollow-file', metavar='OBJFILE', action='append', default=[], help='Nofollow all functions defined in the specified object file')
     pgroup.add_argument('--nofollow-from', metavar='LISTFILE', action='append', default=[], help='Nofollow all functions listed in the specified file (one per line)')
+    pgroup.add_argument('--follow', metavar='FUNCTION', action='append', default=[], help='Do follow calls from the specified function when processing includes (overrides nofollow)')
+    pgroup.add_argument('--follow-file', metavar='OBJFILE', action='append', default=[], help='Follow all functions defined in the specified object file')
+    pgroup.add_argument('--follow-from', metavar='LISTFILE', action='append', default=[], help='Follow all functions listed in the specified file (one per line)')
 
     pgroup = parser.add_argument_group('Configuring DOT Output')
     pgroup.add_argument('--group-by-file', '-g', action='store_true', help='Group functions defined in the same file together')
@@ -311,6 +314,8 @@ if __name__ == '__main__':
     include_nodes = nodeset_from_args(args.include, args.include_file, args.include_from, "Include")
     exclude_nodes = nodeset_from_args(args.exclude, args.exclude_file, args.exclude_from, "Exclude")
     nofollow_nodes = nodeset_from_args(args.nofollow, args.nofollow_file, args.nofollow_from, "Nofollow")
+    follow_nodes = nodeset_from_args(args.follow, args.follow_file, args.follow_from, "Follow")
+    nofollow_nodes -= follow_nodes
 
     for func in args.highlight:
         try:
