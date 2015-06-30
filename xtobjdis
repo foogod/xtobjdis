@@ -617,6 +617,27 @@ class IndirectRegisterValue (RegisterValue):
         return None
 
 
+class StoreOpNote:
+    "Used for the opcode note for 'store' opcodes.  Holds two values and formats them into the appropriate format when rendering output."
+    def __init__(self, v1, v2, width):
+        self.v1 = v1
+        self.v2 = v2
+        self.width = width
+
+    def __str__(self):
+        if self.v1 is None:
+            v1text = '?'
+        elif not isinstance(self.v1, RegisterValue):
+            v1text = str(self.v1)
+        elif isinstance(self.v1.value, int):
+            v1 = self.v1.value
+            mask = (1 << (self.width * 8)) - 1
+            v1text = '0x{:0{digits}x}'.format(v1 & mask, digits=self.width*2)
+        else:
+            v1text = str(self.v1)
+        return "{} -> {}".format(v1text, self.v2)
+
+
 class Region:
     region_type = "invalid"
 
@@ -810,9 +831,13 @@ class FunctionRegion (Region):
         debug(2, "Resolving regs...")
         #TODO: abi/noabi
         # On entry into a function, all we really know is that a1 points to the
-        # top of our local stack (frame pointer).
+        # top of our local stack (frame pointer), and that a2 through a7 are
+        # arguments passed from the caller.
         self.stack = StackPseudoSection(self)
-        disassembly[0].regs = {'a1': RegisterValue(Addr(self.stack, 0))}
+        regs = {'a1': RegisterValue(Addr(self.stack, 0))}
+        for i in range(2, 8):
+            regs['a{}'.format(i)] = RegisterValue('arg{}'.format(i - 2))
+        disassembly[0].regs = regs
         repeat_pass = True
         while repeat_pass:
             repeat_pass = False
@@ -971,7 +996,12 @@ class FunctionRegion (Region):
             opcode_info = OPCODE_INFO.get(instr, {})
             opcode_type = opcode_info.get('type')
 
-            if opcode.value:
+            if opcode_type == 'store':
+                v = opcode.regs.get(opcode.args[0])
+                if v is None:
+                    v = opcode.args[0]
+                opcode.add_note(StoreOpNote(v, opcode.value, OPCODE_ACCESS_WIDTH[instr]))
+            elif opcode.value:
                 opcode.add_note(opcode.value)
 
             if instr == 'l32r':
