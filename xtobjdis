@@ -996,13 +996,14 @@ class FunctionRegion (Region):
             opcode_info = OPCODE_INFO.get(instr, {})
             opcode_type = opcode_info.get('type')
 
-            if opcode_type == 'store':
-                v = opcode.regs.get(opcode.args[0])
-                if v is None:
-                    v = opcode.args[0]
-                opcode.add_note(StoreOpNote(v, opcode.value, OPCODE_ACCESS_WIDTH[instr]))
-            elif opcode.value:
-                opcode.add_note(opcode.value)
+            if opcode.value:
+                if opcode_type == 'store':
+                    v = (opcode.regs or {}).get(opcode.args[0])
+                    if v is None:
+                        v = opcode.args[0]
+                    opcode.add_note(StoreOpNote(v, opcode.value, OPCODE_ACCESS_WIDTH[instr]))
+                else:
+                    opcode.add_note(opcode.value)
 
             if instr == 'l32r':
                 debug(3, "{!r}: annotating {!r} as literal data.".format(opcode.addr, opcode.args[1]))
