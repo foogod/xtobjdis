@@ -945,9 +945,8 @@ class FunctionRegion (Region):
                     else:
                         debug(3, "Reached end of code path.")
                         break
-
-                # Write the new regs to the next opcode in sequence
-                if next_opcode:
+                elif next_opcode:
+                    # Write the new regs to the next opcode in sequence
                     self._update_opcode_regs(next_opcode, regs, opcode.addr)
 
                 i += 1
