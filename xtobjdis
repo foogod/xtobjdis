@@ -61,6 +61,10 @@ OPCODE_INFO = {
         type='branch',
         flow_break=True,
     ),
+    'jx': dict(
+        type='branch',
+        flow_break=True,
+    ),
     'ret': dict(
         flow_break=True,
     ),
