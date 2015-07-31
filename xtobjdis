@@ -68,6 +68,9 @@ OPCODE_INFO = {
     'ret': dict(
         flow_break=True,
     ),
+    'rfe': dict(
+        flow_break=True,
+    ),
     'l32r': dict(
         slot0=1,
         type='literal',
@@ -679,6 +682,7 @@ class FunctionRegion (Region):
         self.func_name = func_name
         self.disassembly = None
         self.call_targets = []
+        self.stack = StackPseudoSection(self)
 
     def code_analysis(self):
         if self.disassembly is not None:
@@ -691,14 +695,17 @@ class FunctionRegion (Region):
         # point of the routine.
         disassembly, branch_dests = self._get_disassembly(self.start, self.end)
 
-        # Next, go through and try to determine the values of the registers at
-        # each point.
-        self._resolve_regs(disassembly, branch_dests)
+        if disassembly:
+            # Next, go through and try to determine the values of the registers at
+            # each point.
+            self._resolve_regs(disassembly, branch_dests)
 
-        # And finally, make annotations all over the place based on the results.
-        self._perform_annotations(disassembly)
+            # And finally, make annotations all over the place based on the results.
+            self._perform_annotations(disassembly)
 
-        self.end = disassembly[-1].addr + disassembly[-1].length
+            self.end = disassembly[-1].addr + disassembly[-1].length
+        else:
+            self.end = self.start
         self.disassembly = disassembly
         self.fixup()
         return True
@@ -738,8 +745,8 @@ class FunctionRegion (Region):
                 else:
                     # If slot0 wasn't updated with a relocation, try to
                     # determine what type of value it should be.
-                    if opcode_type == 'branch':
-                        # If it's a branch/jump instruction, the arg is a
+                    if opcode_type in ('branch', 'call', 'literal'):
+                        # If it's a branch/call/l32r instruction, the arg is a
                         # label, which the disassembler writes as just the
                         # address (base 16), so convert it to an Addr in the
                         # same section with that offset.
@@ -747,8 +754,8 @@ class FunctionRegion (Region):
                         addr = Addr(section, int(addr, 16))
                         opcode.args[slot0_arg] = addr
                     else:
-                        # If it's not a branch, and wasn't relocated, assume
-                        # it's just an integer instead of an address
+                        # If it's not a branch/call/l32r, and wasn't relocated,
+                        # assume it's just an integer instead of an address
                         value = int(opcode.args[slot0_arg], 0)
                         if value > 0x7fffffff:
                             value -= 0x100000000
@@ -837,7 +844,6 @@ class FunctionRegion (Region):
         # On entry into a function, all we really know is that a1 points to the
         # top of our local stack (frame pointer), and that a2 through a7 are
         # arguments passed from the caller.
-        self.stack = StackPseudoSection(self)
         regs = {'a1': RegisterValue(Addr(self.stack, 0))}
         for i in range(2, 8):
             regs['a{}'.format(i)] = RegisterValue('arg{}'.format(i - 2))
@@ -870,7 +876,10 @@ class FunctionRegion (Region):
                 regs = opcode.regs.copy()
                 value = None
                 if opcode_type == 'literal':
-                    value = RegisterValue(self.section.get_word(opcode.args[1]))
+                    try:
+                        value = RegisterValue(self.section.get_word(opcode.args[1]))
+                    except IndexError:
+                        pass
                 elif opcode_type in ('load', 'store'):
                     value = regs.get(opcode.args[1])
                     if value:
@@ -929,13 +938,20 @@ class FunctionRegion (Region):
                 # destination.
                 dest_i = None
                 if opcode_type == 'branch':
-                    addr = opcode.args[opcode_info['slot0']]
-                    dest_i = branch_dests[addr]
-                    if dest_i is not None:
-                        dest_opcode = disassembly[dest_i]
-                        self._update_opcode_regs(dest_opcode, regs, opcode.addr)
+                    if 'slot0' in opcode_info:
+                        addr = opcode.args[opcode_info['slot0']]
                     else:
-                        debug(1, "Opcode at {!r} branches to {!r}, but that does not correspond to an opcode in this code block.  Cannot propagate register values.".format(opcode.addr, addr))
+                        # If there's no slot0, then arg 0 must be a register
+                        # name..
+                        addr = regs.get(opcode.args[0])
+                    if addr is not None:
+                        opcode.dest_addr = addr
+                        dest_i = branch_dests[addr]
+                        if dest_i is not None:
+                            dest_opcode = disassembly[dest_i]
+                            self._update_opcode_regs(dest_opcode, regs, opcode.addr)
+                        else:
+                            debug(1, "Opcode at {!r} branches to {!r}, but that does not correspond to an opcode in this code block.  Cannot propagate register values.".format(opcode.addr, addr))
 
                 if opcode_info.get('flow_break'):
                     # There's no way to 'fall through' from this opcode to
@@ -1033,7 +1049,7 @@ class FunctionRegion (Region):
                     self.call_targets.append((opcode.addr, addr))
                 else:
                     debug(3, "{!r}: call destination ({}) value unknown.  No action taken.".format(opcode.addr, opcode.args[0]))
-            elif opcode_type == 'branch':
+            elif opcode_type == 'branch' and opcode.dest_addr is not None:
                 debug(3, "{!r}: annotating {!r} as branch destination.".format(opcode.addr, opcode.dest_addr))
                 self.section.register_branch(opcode.addr, opcode.dest_addr)
 
@@ -1305,6 +1321,7 @@ class Section:
         elif addr.section != self:
             raise ValueError("Attempt to register entry point {!r} in section {}".format(addr, self.name))
         self.annotate(addr, 'type', 'code')
+        self.annotate(addr, 'end-of-code', True)
         self.annotate(addr, 'ref', 'entry_point')
         if name:
             self.annotate(addr, 'name', name)
@@ -1383,16 +1400,22 @@ class Section:
         return self.data[int(addr)]
 
     def get_data_hword(self, addr):
+        addr = int(addr)
+        if addr < 0 or addr > len(self.data) - 2:
+            raise IndexError(addr)
         if self.objfile.little_endian:
-            return struct.unpack_from('<H', self.data, int(addr))[0]
+            return struct.unpack_from('<H', self.data, addr)[0]
         else:
-            return struct.unpack_from('>H', self.data, int(addr))[0]
+            return struct.unpack_from('>H', self.data, addr)[0]
 
     def get_data_word(self, addr):
+        addr = int(addr)
+        if addr < 0 or addr > len(self.data) - 4:
+            raise IndexError(addr)
         if self.objfile.little_endian:
-            return struct.unpack_from('<I', self.data, int(addr))[0]
+            return struct.unpack_from('<I', self.data, addr)[0]
         else:
-            return struct.unpack_from('>I', self.data, int(addr))[0]
+            return struct.unpack_from('>I', self.data, addr)[0]
 
     def get_region(self, offset):
         if not self.regions:
@@ -1441,7 +1464,7 @@ class Section:
     def code_analysis(self):
         changed = False
         for start in self.find_new_function_regions():
-            end = self.find_next_non_function_region(start)
+            end = self.find_end_of_code(start)
             if end is None:
                 end = Addr(self, len(self.data))
             debug(2, "Found new code region at {!r} - {!r}".format(start, end))
@@ -1479,12 +1502,14 @@ class Section:
             else:
                 debug(3, "find_new_function_regions: type!=code")
 
-    def find_next_non_function_region(self, start):
+    def find_end_of_code(self, start):
         #TODO: is there a more efficient way to do this?
         for addr, notes in self.annotations.items():
             if addr <= start:
                 continue
             if 'code' not in notes.get('type', {'code'}):
+                return addr
+            if 'end-of-code' in notes:
                 return addr
             
     def data_analysis(self):
@@ -1924,6 +1949,15 @@ class ObjdumpDisassembler:
     def __init__(self, objdump_path):
         self.objdump_path = objdump_path
 
+    def objdump_command(self, filename, start, end):
+        section = start.section
+        section_name = section.name
+        cmd = [self.objdump_path, '-Dz', '--section={}'.format(section_name), '--start-address={}'.format(start.offset)]
+        if end:
+            cmd.append('--stop-address={}'.format(end.offset))
+        cmd.append(filename)
+        return cmd
+
     def disassemble(self, filename, start, end=None):
         """
         Invoke objdump to disassemble the bytes in section from start to end
@@ -1932,11 +1966,7 @@ class ObjdumpDisassembler:
         Yields a series of Opcodes.
         """
         section = start.section
-        section_name = section.name
-        cmd = [self.objdump_path, '-Dz', '--section={}'.format(section_name), '--start-address={}'.format(start.offset)]
-        if end:
-            cmd.append('--stop-address={}'.format(end.offset))
-        cmd.append(filename)
+        cmd = self.objdump_command(filename, start, end)
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=1)
         except Exception as e:
@@ -1959,9 +1989,25 @@ class ObjdumpDisassembler:
             op_instr = op[2]
             op_args = [a.strip() for a in op[3].split(',')]
             #TODO: check hexdata against objdump hexdata
-            yield Opcode(op_addr, op_length, op_instr, op_args)
+            if op_addr + op_length <= end:
+                yield Opcode(op_addr, op_length, op_instr, op_args)
+            else:
+                debug(2, "Opcode extends past end of disassembly ({!r} + {} is greater than {!r})".format(op_addr, op_length, end))
         if proc.wait() != 0:
             raise DisassemblyFailedException("Disassembly failed (section={}, start={}, end={})".format(section, start, end))
+
+
+class RawObjdumpDisassembler (ObjdumpDisassembler):
+    def objdump_command(self, filename, start, end):
+        # We're disassembling a raw file, so just ignore any section specified
+        # in start/end and use the offsets..
+        #FIXME: the '-mxtensa' should be determined by the type of file we're
+        # disassembling, not hardcoded
+        cmd = [self.objdump_path, '-Dz', '--target=binary', '-mxtensa', '--start-address={}'.format(start.offset)]
+        if end:
+            cmd.append('--stop-address={}'.format(end.offset))
+        cmd.append(filename)
+        return cmd
 
 
 def print_elf_info(elf):
@@ -2097,6 +2143,55 @@ def load_elf_annotations(objfile, elf):
     for section in objfile.sections.values():
         if isinstance(section, (XtPropSection, XtLitSection)):
             section.apply_annotations()
+
+
+def load_raw_data(objfile, f, raw_offset, section_name):
+    objfile.elffile = None
+    objfile.little_endian = True  #TODO: make this configurable
+    section = CodeSection(objfile, 0, section_name, f.read())
+    section.sh_type = 'SHT_PROGBITS'
+    section.sh_entsize = 0
+    section.flag_alloc = True
+    section.flag_writable = False
+    section.flag_exec = True
+    section.flag_mergeable = False
+    section.flag_strings = False
+    section.flag_group = False
+    section.flag_tls = False
+    objfile.add_section(section)
+
+
+def parse_addr_spec(string, default_section_name=None):
+    if ':' in string:
+        string, name = string.split(':', 2)
+    else:
+        name = None
+    if '+' in string:
+        section, offset = string.split('+', 2)
+    else:
+        section = default_section_name
+        offset = string
+    offset = int(offset, 0)
+    if offset < 0:
+        raise ValueError("Offset must be nonnegative")
+    if section is None:
+        raise ValueError("No section specified")
+    return (section, offset, name)
+
+
+def add_manual_entrypoints(objfile, entry_specs):
+    for (section_name, offset, name) in entry_specs:
+        section = objfile.get_section(section_name)
+        if section is None:
+            log.error("No such section for entrypoint (ignored): {}+0x{:x}".format(section_name, offset))
+            continue
+        addr = Addr(section, offset, name)
+        section.annotate(addr, 'manual-entrypoint', name)
+        debug(1, "Noting function entry point at {!r}".format(addr))
+        section.register_entry_point(addr, name=name)
+        if name:
+            debug(1, "Adding label for entrypoint at {!r}".format(addr))
+            section.add_label(addr, name)
 
 
 class DumpWriter:
@@ -2355,6 +2450,8 @@ if __name__ == '__main__':
     parser.add_argument('--version', action='version', version='%(prog)s {}'.format(VERSION_STRING))
     parser.add_argument('filename', metavar='OBJFILE', type=str,
                        help='ELF object (.o) file to disassemble')
+    parser.add_argument('--raw', metavar='OFFSET[:NAME]', type=str, help="Treat OBJFILE as a raw (not ELF) dump (assume it's loaded at start address OFFSET, and give it section name NAME in the disassembled output)")
+    parser.add_argument('--entry', metavar='ADDR[:NAME]', action='append', default=[], help='Treat ADDR as a function entry point (optionally named NAME)')
     parser.add_argument('--verbose', '-v', action='count', default=0,
                        help='Increase output verbosity (can be specified multiple times)')
     parser.add_argument('--quiet', '-q', action='count', default=0,
@@ -2401,11 +2498,39 @@ if __name__ == '__main__':
         log.error("Unable to find {!r} in either {} or the system path.  Please specify the location of an appropriate objdump executable with the '--objdump' option.".format(args.objdump, install_directory))
         sys.exit(1)
 
+    if args.raw is not None:
+        rawinfo = args.raw.split(':', 2)
+        try:
+            raw_offset = int(rawinfo[0], 0)
+        except ValueError:
+            raw_offset = -1
+        if raw_offset < 0:
+            log.error("Invalid offset for --raw ({!r}).  Must be a nonnegative integer.".format(rawinfo[0]))
+            sys.exit(1)
+        if len(rawinfo) < 2:
+            raw_name = '.text'
+        else:
+            raw_name = rawinfo[1]
+    else:
+        raw_offset = None
+        raw_name = None
+
+    if args.entry:
+        for i in range(len(args.entry)):
+            try:
+                args.entry[i] = parse_addr_spec(args.entry[i], raw_name)
+            except ValueError:
+                log.error("Invalid address specified for --entry: {!r}".format(args.entry[i]))
+
     info(1, "xtobjdump version {}".format(VERSION_STRING))
     info(1, "  objdump={}".format(args.objdump))
     info(1, "  hexdump={}".format(not args.nohex))
     info(1, "  opnotes={}".format(not args.noopnotes))
     info(1, "  annotations={}".format(args.annotations))
+    if args.raw:
+        info(1, "  raw=yes ({})".format(args.raw))
+    else:
+        info(1, "  raw=no")
     info(1, "Disassembling: {}".format(args.filename))
     info(1, "")
 
@@ -2416,18 +2541,29 @@ if __name__ == '__main__':
         dw.output_annotations = True
 
     with open(args.filename, 'rb') as f:
+        if args.raw:
+            disassembler = RawObjdumpDisassembler(args.objdump)
+        else:
+            try:
+                elf = ELFFile(f)
+            except ELFError:
+                print_elf_format_error(args, f)
+                sys.exit(1)
+            disassembler = ObjdumpDisassembler(args.objdump)
         try:
-            elf = ELFFile(f)
-        except ELFError:
-            print_elf_format_error(args, f)
-            sys.exit(1)
-        try:
-            objfile = ObjectFile(args.filename, ObjdumpDisassembler(args.objdump))
-            print_elf_info(elf)
-            debug(1, "=== Loading ELF Data...")
-            load_elf_data(objfile, elf)
-            debug(1, "=== Starting annotation phase...")
-            load_elf_annotations(objfile, elf)
+            objfile = ObjectFile(args.filename, disassembler)
+            if args.raw:
+                debug(1, "=== Loading RAW Data...")
+                load_raw_data(objfile, f, raw_offset, raw_name)
+            else:
+                print_elf_info(elf)
+                debug(1, "=== Loading ELF Data...")
+                load_elf_data(objfile, elf)
+                debug(1, "=== Loading annotations from ELF file...")
+                load_elf_annotations(objfile, elf)
+            if args.entry:
+                debug(1, "=== Applying manual annotations...")
+                add_manual_entrypoints(objfile, args.entry)
             debug(1, "=== Starting code analysis phase...")
             objfile.code_analysis()
             debug(1, "=== Starting data analysis phase...")

@@ -45,7 +45,7 @@ Note that you will need to have the **xtensa-lx106-elf-objdump** program in the 
 
 Note also that **xtobjdis** only supports disassembling ELF object (.o) files.  If you want to disassemble a library (.a) file, you will need to either split it out into its component .o files, or link it together into a single .o file containing all the contents first.  (Instructions for doing either of these will be printed by **xtobjdis** if you run it against an .a file directly.)
 
-If you have a binary blob, you will need to convert it to an ELF object file first using **objcopy** or some similar tool.  Note that a large amount of the ELF meta-info xtobjdis has to work with will probably not be present in this case, so the result will likely not be as detailed (but should still be substantially better than a raw objdump).
+If you have a binary blob, you can disassemble it with objdump using the `--raw` and `--entry` options.  Note that a large amount of the ELF meta-info xtobjdis has to work with will probably not be present in this case, so the result will likely not be as detailed (but should still be substantially better than a raw objdump).
 
 Limitations
 -----------
