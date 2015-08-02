@@ -1,5 +1,7 @@
 #!/usr/bin/python3
 
+#TODO: When literals are converted to relocptrs in raw mode, register value annotations are not updated to match.
+#TODO: Add the ability to specify a data location explicitly as an address pointer
 #TODO: windowed-call support
 #TODO: better sorted data structure for section regions/annotations
 #TODO: noabi switch
@@ -16,6 +18,7 @@ import struct
 import bisect
 import logging
 import json
+import hashlib
 
 import elftools
 from elftools.elf.elffile import ELFFile
@@ -321,7 +324,7 @@ def is_zeroes(data):
 
 ASCII_CHARS = {10, 13} | set(range(0x20, 0x7f))
 
-def is_ascii_data(start, end):
+def is_ascii_data(start, end, no_extra=True):
     section = start.section
     start_offset = start.offset
     end_offset = end.offset
@@ -331,12 +334,15 @@ def is_ascii_data(start, end):
             continue
         if c == 0 and i != start_offset:
             # We ran into a null byte.  This may just be termination/padding at
-            # the end of the string, which is fine.  Make sure everything from
-            # here to the end is all zeroes, though.
-            if is_zeroes(section.data[i:end_offset]):
-                # Return a length including the first zero-byte (assuming this
-                # is an asciiz string).
-                return i - start_offset + 1
+            # the end of the string, which is fine.
+            if no_extra:
+                # Make sure everything from here to the end is all zeroes,
+                # though.
+                if not is_zeroes(section.data[i:end_offset]):
+                    return False
+            # Return a length including the first zero-byte (assuming this
+            # is an asciiz string).
+            return i - start_offset + 1
         return False
     return end - start
 
@@ -510,7 +516,10 @@ class Addr:
         return not self.__eq__(other)
 
     def __hash__(self):
-        return hash(self.section.name) + self.offset
+        if self.section:
+            return hash(self.section.name) + self.offset
+        else:
+            return self.offset
 
 
 class Symbol (Addr):
@@ -707,20 +716,33 @@ class FunctionRegion (Region):
         else:
             self.end = self.start
         self.disassembly = disassembly
-        self.fixup()
+        self.cleanup()
         return True
 
     def _get_disassembly(self, start, end):
-        debug(2, "Performing relocation fixups...")
+        debug(2, "Performing relocations...")
         section = self.section
         disassembly = []
         branch_dests = {}
         generator = section.objfile.disassemble(start, end)
+        no_trim_func = 'no-trim-func' in section.annotations.get(start, {})
+        opcode_marker = section.find_next_annotation(start, 'opcode') or end
         while True:
             try:
                 opcode = next(generator)
             except StopIteration:
                 break
+            if opcode.addr == opcode_marker:
+                debug(3, "Opcode at {!r} matches 'opcode' annotation at {!r}.  No resynchronization required.".format(opcode.addr, opcode_marker))
+                opcode_marker = section.find_next_annotation(opcode_marker, 'opcode') or end
+            elif opcode.addr + opcode.length > opcode_marker:
+                debug(2, "Opcode at {!r} overlaps 'opcode' annotation at {!r}.  Resynchronizing disassembly.".format(opcode.addr, opcode_marker))
+                for i in range(opcode.addr.offset, opcode_marker.offset):
+                    disassembly.append(Opcode(Addr(section, i), 1, '.byte', ['0x{:02x}'.format(section.data[i])]))
+                flush(generator)
+                generator = section.objfile.disassemble(opcode_marker, end)
+                opcode_marker = section.find_next_annotation(opcode_marker, 'opcode') or end
+                continue
             instr = opcode.instr
             if instr.endswith('.n'):
                 instr = instr[:-2]
@@ -776,8 +798,9 @@ class FunctionRegion (Region):
                 # to a point later than this in the code, then it shouldn't
                 # ever be possible for code flow to go past this point, which
                 # means we're at the end of the function.
-                if not branch_dests or opcode.addr >= max(branch_dests.keys()):
-                    break
+                if not no_trim_func:
+                    if not branch_dests or opcode.addr >= max(branch_dests.keys()):
+                        break
                 next_addr = opcode.addr + opcode.length
                 if next_addr not in branch_dests:
                     if (next_addr + 1) in branch_dests:
@@ -1063,9 +1086,9 @@ class FunctionRegion (Region):
 
     def adjust_end(self, end):
         self.end = end
-        self.fixup()
+        self.cleanup()
 
-    def fixup(self):
+    def cleanup(self):
         old_len = len(self.disassembly)
         while self.disassembly and self.disassembly[-1].addr >= self.end:
             self.disassembly.pop()
@@ -1203,6 +1226,13 @@ class RelocPtrRegion (WordDataRegion):
         self.offset = self.value + addend
         self.target_addr = sym + self.offset
 
+    @classmethod
+    def promote(cls, obj, sym, addend):
+        obj.__class__ = cls
+        obj.sym = sym
+        obj.offset = obj.value + addend
+        obj.target_addr = sym + obj.offset
+
     def get_word(self, addr):
         if addr == self.start:
             return self.target_addr
@@ -1287,6 +1317,7 @@ class Section:
         self.index = index
         self.name = name
         self.data = data
+        self.base_address = None
         self.labels = {}
         self.regions = SortedDict()
         self.slot_relocs = {}
@@ -1338,13 +1369,14 @@ class Section:
         self.annotate(addr, 'ref', 'literal')
         self.annotate(addr, 'data_size', 4)
 
-    def register_data(self, addr, data_size):
+    def register_data(self, addr, data_size, add_ref=True):
         if not isinstance(addr, Addr) or addr.section is None:
             addr = Addr(self, int(addr))
         elif addr.section != self:
             raise ValueError("Attempt to register data {!r} in section {}".format(addr, self.name))
         addr.section.annotate(addr, 'type', 'data')
-        addr.section.annotate(addr, 'ref', 'data')
+        if add_ref:
+            addr.section.annotate(addr, 'ref', 'data')
         addr.section.annotate(addr, 'data_size', data_size)
 
     def register_reloc_ptr(self, addr, sym, addend):
@@ -1511,18 +1543,57 @@ class Section:
                 return addr
             if 'end-of-code' in notes:
                 return addr
-            
+        return None
+
+    def find_next_annotation(self, start, notetypes):
+        if isinstance(notetypes, str):
+            notetypes = {notetypes}
+        else:
+            notetypes = set(notetypes)
+        #TODO: is there a more efficient way to do this?
+        for addr, notes in self.annotations.items():
+            if addr <= start:
+                continue
+            if notes.keys() & notetypes:
+                return addr
+        return None
+
     def data_analysis(self):
         changed = False
         for addr in self.find_new_data_regions():
             ann = self.annotations[addr]
+            data_type = ann.get('data_type', {})
             data_size = ann.get('data_size', {})
-            if 4 in data_size:
-                region = WordDataRegion(addr)
+            end = None
+            if 'str' in data_type:
+                dtype = 'str'
+                datalen = ann.get('data_length', {})
+                if datalen:
+                    end = addr + max(datalen)
+                else:
+                    end = self.find_next_region(addr)
+                    strlen = is_ascii_data(addr, end, False)
+                    if strlen:
+                        end = addr + strlen
+                    else:
+                        # It's marked as a string, but it's not ASCII, and we
+                        # don't know where the end is.  Just represent it as
+                        # .bytes instead.
+                        debug(1, "{!r} marked as string, but not ASCII.  Representing as .byte data instead.".format(addr))
+                        dtype = 'bytes'
+            elif 'bytes' in data_type:
+                dtype = 'bytes'
+                datalen = ann.get('data_length', {})
+                if datalen:
+                    end = addr + max(datalen)
+                else:
+                    end = self.find_next_region(addr)
+            elif 4 in data_size:
+                dtype = 4
             elif 2 in data_size:
-                region = HalfWordDataRegion(addr)
+                dtype = 2
             elif 1 in data_size:
-                region = BytesDataRegion(addr)
+                dtype = 1
             else:
                 # Default to word, but only if we're starting on a 32-bit
                 # boundary, and only if there's exactly 4 bytes between us and
@@ -1536,14 +1607,29 @@ class Section:
                     # annotation at the beginning of an empty section.
                     continue
                 elif size == 4 and not addr.offset % 4:
-                    region = WordDataRegion(addr)
+                    dtype = 4
                 else:
                     strlen = is_ascii_data(addr, end)
                     if strlen >= MIN_ASCII_LEN:
-                        region = AsciiDataRegion(addr, addr + strlen)
+                        dtype = 'str'
+                        end = addr + strlen
                         self.annotate(addr, 'ref', 'str')
+                        self.annotate(addr, 'data_type', 'str')
                     else:
-                        region = BytesDataRegion(addr, end)
+                        dtype = 'bytes'
+                        #self.annotate(addr, 'data_type', 'bytes')
+
+            if dtype == 4:
+                region = WordDataRegion(addr)
+            elif dtype == 2:
+                region = HalfWordDataRegion(addr)
+            elif dtype == 1:
+                region = BytesDataRegion(addr)
+            elif dtype == 'str':
+                region = AsciiDataRegion(addr, end)
+            else:
+                region = BytesDataRegion(addr, end)
+
             debug(1, "Identified {} region at {!r}".format(region.region_type, addr))
             self.add_region(region)
             changed = True
@@ -1581,8 +1667,8 @@ class Section:
         end = self.regions.iloc[self.regions.bisect(start.offset)]
         return end - start
 
-    def fixup(self):
-        debug(1, "Applying fixups for section {}".format(self.name))
+    def cleanup(self):
+        debug(1, "Applying cleanups for section {}".format(self.name))
         offset = 0
         for r in self.regions.values():
             start_offset = r.start.offset
@@ -1591,6 +1677,8 @@ class Section:
             offset = r.end.offset
         if offset != len(self.data):
             self.fill_in_region_gap(offset, len(self.data))
+        if self.base_address is not None:
+            self.identify_address_literals()
 
     def fill_in_region_gap(self, start, end):
         debug(2, "Region gap found from 0x{:x} to 0x{:x}...".format(start, end))
@@ -1644,6 +1732,31 @@ class Section:
                 debug(1, "Added unknown-data region from 0x{:x} to 0x{:x}".format(start, j))
                 start = j
 
+    def identify_address_literals(self):
+        # When operating on a raw input with a known base address, try to find
+        # any literals which have a value corresponding to the address of
+        # something noteworthy in the same segment.  If we find any, convert
+        # them to address pointers.
+        start_offset = self.base_address
+        end_offset = start_offset + len(self.data)
+        sym = Symbol(self, 0, self.name)
+        for r in list(self.regions.values()):
+            if not isinstance(r, WordDataRegion):
+                continue
+            refs = self.annotations.get(r.start, {}).get('ref', {})
+            if 'literal' not in refs:
+                continue
+            if r.value < start_offset or r.value >= end_offset:
+                continue
+            addr = Addr(self, r.value - start_offset)
+            dest_notes = self.annotations.get(addr, {})
+            refs = dest_notes.get('ref', {})
+            syms = dest_notes.get('symbol', {})
+            if (refs and refs != {'branch'}) or syms:
+                debug(1, "Literal at {!r} appears to be an address pointer to {!r}.  Converting to address reference.".format(r.start, addr))
+                RelocPtrRegion.promote(r, sym, -start_offset)
+
+
     def dump(self, writer):
         writer.start_section(self)
         for r in self.regions.values():
@@ -1657,6 +1770,7 @@ class Section:
             if m is not None:
                 result[r] = m
         return result
+
 
 class CodeSection (Section):
     sh_type = 'SHT_PROGBITS'
@@ -1686,7 +1800,7 @@ class MetadataSection (Section):
     def data_analysis(self):
         pass
 
-    def fixup(self):
+    def cleanup(self):
         pass
 
     def dump(self, writer):
@@ -1759,8 +1873,7 @@ class XtPropSection (MetadataSection):
                 continue
             if flags & XTENSA_PROP_LITERAL:
                 debug(1, "Annotating {!r} as literal (.xt.prop entry {})".format(addr, i))
-                addr.section.annotate(addr, 'type', 'data')
-                addr.section.annotate(addr, 'ref', 'literal')
+                addr.section.register_literal(addr)
             if flags & XTENSA_PROP_INSN:
                 debug(1, "Annotating {!r} as code (.xt.prop entry {})".format(addr, i))
                 addr.section.annotate(addr, 'type', 'code')
@@ -1872,10 +1985,10 @@ class ObjectFile:
         for section in self.sections.values():
             section.data_analysis()
 
-    def fixup(self):
+    def cleanup(self):
         self.generate_labels()
         for section in self.sections.values():
-            section.fixup()
+            section.cleanup()
 
     def generate_labels(self):
         current_counters = {}
@@ -1941,6 +2054,177 @@ class ObjectFile:
     def disassemble(self, start, end=None):
         return self.disassembler.disassemble(self.filename, start, end)
 
+    def add_symbol(self, index, section, offset, name, symtype):
+        sym = Symbol(section, offset, name)
+        sym.type = symtype
+        self.symbols[index] = sym
+        self.symbols[name] = sym
+
+    def get_symbol(self, name):
+        return self.symbols.get(name)
+
+    def parse_addr(self, addrspec, name=None):
+        basespec = None
+        if isinstance(addrspec, int):
+            offset = addrspec
+        else:
+            if '+' in addrspec:
+                basespec, offset = addrspec.split('+', 2)
+                offset = int(offset, 0)
+            elif '-' in addrspec:
+                basespec, offset = addrspec.split('-', 2)
+                offset = -int(offset, 0)
+            else:
+                if self.get_section(addrspec) or self.get_symbol(addrspec):
+                    basespec = addrspec
+                    offset = 0
+                else:
+                    offset = int(addrspec, 0)
+        if basespec:
+            section = self.get_section(basespec)
+            if section is None:
+                base = self.get_symbol(basespec)
+                if base is None:
+                    raise ValueError("Bad section/symbol name: {!r}".format(basespec))
+                addr = base + offset
+                addr.name = name
+                return addr
+        else:
+            # We just got a bare offset with no section/symbol name
+            if len(self.sections) == 1:
+                # We've only got one section defined (probably in --raw mode)
+                # so this is OK, we'll just infer it.
+                section = next(iter(self.sections.values()))
+            else:
+                raise ValueError("Must be of the form <name>+<offset>")
+        return Addr(section, offset, name)
+
+    def add_manual_symbols(self, specs):
+        for (addrspec, syminfo) in specs:
+            name, symtype = (syminfo.split() + ['STT_NOTYPE'])[:2]
+            try:
+                addr = self.parse_addr(addrspec, name or None)
+            except ValueError as e:
+                log.error("Invalid address for symbol: {!r}: {}".format(addrspec, e))
+                continue
+            addr.section.annotate(addr, 'manual:symbol', name)
+            debug(1, "Adding symbol ({}) for entrypoint at {!r}".format(name, addr))
+            self.add_symbol(None, addr.section, addr.offset, name, symtype)
+
+    def add_manual_entrypoints(self, specs):
+        for (addrspec, name) in specs:
+            try:
+                addr = self.parse_addr(addrspec, name or None)
+            except ValueError as e:
+                log.error("Invalid address for entrypoint: {!r}: {}".format(addrspec, e))
+                continue
+            addr.section.annotate(addr, 'manual:entrypoint', name)
+            debug(1, "Noting function entry point at {!r}".format(addr))
+            addr.section.register_entry_point(addr, name=name)
+            if name:
+                debug(1, "Adding symbol ({}) for entrypoint at {!r}".format(name, addr))
+                self.add_symbol(None, addr.section, addr.offset, name, 'STT_FUNC')
+
+    def add_manual_datalocs(self, specs):
+        for (addrspec, note_type) in specs:
+            try:
+                addr = self.parse_addr(addrspec)
+            except ValueError as e:
+                log.error("Invalid address for data location: {!r}: {}".format(addrspec, e))
+                continue
+            if '/' in note_type:
+                data_type, size = note_type.split('/', 2)
+                try:
+                    size = int(size, 0)
+                except ValueError:
+                    size = 0
+                if size < 1:
+                    log.error("Invalid size for data-location spec (must be a positive integer): {!r}".format(note_type))
+                    continue
+            else:
+                data_type = note_type
+                size = 0
+
+            if data_type == 'byte' and size > 1:
+                data_type = 'bytes'
+
+            debug(1, "Noting {} data location at {!r}".format(data_type or 'unspecified', addr))
+            addr.section.annotate(addr, 'manual:data-location', note_type)
+            if not data_type:
+                addr.section.annotate(addr, 'type', 'data')
+            elif data_type == 'literal':
+                if not size:
+                    size = 1
+                for i in range(size):
+                    addr.section.register_literal(addr + (i * 4))
+            elif data_type == 'word':
+                if not size:
+                    size = 1
+                for i in range(size):
+                    addr.section.register_data(addr + (i * 4), 4, False)
+            elif data_type == 'hword':
+                if not size:
+                    size = 1
+                for i in range(size):
+                    addr.section.register_data(addr + (i * 2), 2, False)
+            elif data_type == 'byte':
+                addr.section.register_data(addr, 1, False)
+            elif data_type == 'bytes':
+                addr.section.annotate(addr, 'type', 'data')
+                addr.section.annotate(addr, 'data_type', 'bytes')
+                if size:
+                    addr.section.annotate(addr, 'data_length', size)
+            elif data_type == 'str':
+                addr.section.annotate(addr, 'type', 'data')
+                addr.section.annotate(addr, 'data_type', 'str')
+                if size:
+                    addr.section.annotate(addr, 'data_length', size)
+
+    def add_manual_annotations(self, specs):
+        for (addrspec, note) in specs:
+            try:
+                addr = self.parse_addr(addrspec)
+            except ValueError as e:
+                log.error("Invalid address for annotation: {!r}: {}".format(addrspec, e))
+                continue
+            addr.section.annotate(addr, 'manual:annotation', note)
+            if isinstance(note, str):
+                if '=' in note:
+                    key, value = note.split('=', 2)
+                    try:
+                        value = int(value, 0)
+                    except ValueError:
+                        pass
+                else:
+                    key = note
+                    value = True
+                note = {key: value}
+            if isinstance(note, dict):
+                pass
+            else:
+                log.error("Bad format/type for annotation: {!r}".format(note))
+                continue
+            for key, value in note.items():
+                debug(1, "Making manual annotation at {!r}: {} = {}".format(addr, key, value))
+                addr.section.annotate(addr, key, value)
+
+    def resolve_annotations(self):
+        sym_labels = {}
+        for sym in self.symbols.values():
+            if sym.section and sym.type != 'STT_SECTION':
+                sym_labels[sym.name] = sym
+        for name in sorted(sym_labels.keys()):
+            sym = sym_labels[name]
+            debug(1, "Adding label for symbol at {!r}".format(sym))
+            sym.section.add_label(sym, name)
+            sym.section.annotate(sym, 'symbol', name)
+            if sym.type == 'STT_FUNC':
+                debug(1, "Noting function entry point at {!r}".format(sym))
+                sym.section.register_entry_point(sym, name=name)
+        for section in self.sections.values():
+            if isinstance(section, (XtPropSection, XtLitSection)):
+                section.apply_annotations()
+
 
 class ObjdumpDisassembler:
     start_re = re.compile('[0-9a-f]+ <.*>:')
@@ -1997,13 +2281,15 @@ class ObjdumpDisassembler:
             raise DisassemblyFailedException("Disassembly failed (section={}, start={}, end={})".format(section, start, end))
 
 
-class RawObjdumpDisassembler (ObjdumpDisassembler):
+class ObjdumpRawDisassembler (ObjdumpDisassembler):
+    def __init__(self, objdump_path, arch):
+        ObjdumpDisassembler.__init__(self, objdump_path)
+        self.arch = arch
+
     def objdump_command(self, filename, start, end):
         # We're disassembling a raw file, so just ignore any section specified
         # in start/end and use the offsets..
-        #FIXME: the '-mxtensa' should be determined by the type of file we're
-        # disassembling, not hardcoded
-        cmd = [self.objdump_path, '-Dz', '--target=binary', '-mxtensa', '--start-address={}'.format(start.offset)]
+        cmd = [self.objdump_path, '-Dz', '--target=binary', '-m{}'.format(self.arch), '--start-address={}'.format(start.offset)]
         if end:
             cmd.append('--stop-address={}'.format(end.offset))
         cmd.append(filename)
@@ -2088,9 +2374,7 @@ def load_elf_data(objfile, elf):
                 if not name and section:
                     name = section.name
             offset = elf_sym.entry['st_value']
-            sym = Symbol(section, offset, name)
-            sym.type = elf_sym.entry['st_info']['type']
-            objfile.symbols[index] = sym
+            objfile.add_symbol(index, section, offset, name, elf_sym.entry['st_info']['type'])
     for elf_section in elf.iter_sections():
         if elf_section.header.sh_type in ('SHT_REL', 'SHT_RELA'):
             rel_section_name = bytes2str(elf_section.name)
@@ -2131,24 +2415,11 @@ def load_elf_data(objfile, elf):
                     log.warn("Unexpected relocation type at {!r} (type={} reloc={}+0x{:x}).  Ignored.".format(addr, r_info_type, sym, addend))
 
 
-def load_elf_annotations(objfile, elf):
-    for sym in objfile.symbols.values():
-        if sym.section and sym.type != 'STT_SECTION':
-            debug(1, "Adding label for symbol at {!r}".format(sym))
-            sym.section.add_label(sym, sym.name)
-            sym.section.annotate(sym, 'symbol', sym.name)
-            if sym.type == 'STT_FUNC':
-                debug(1, "Noting function entry point at {!r}".format(sym))
-                sym.section.register_entry_point(sym, name=sym.name)
-    for section in objfile.sections.values():
-        if isinstance(section, (XtPropSection, XtLitSection)):
-            section.apply_annotations()
-
-
 def load_raw_data(objfile, f, raw_offset, section_name):
     objfile.elffile = None
     objfile.little_endian = True  #TODO: make this configurable
     section = CodeSection(objfile, 0, section_name, f.read())
+    section.base_address = raw_offset
     section.sh_type = 'SHT_PROGBITS'
     section.sh_entsize = 0
     section.flag_alloc = True
@@ -2179,19 +2450,127 @@ def parse_addr_spec(string, default_section_name=None):
     return (section, offset, name)
 
 
-def add_manual_entrypoints(objfile, entry_specs):
-    for (section_name, offset, name) in entry_specs:
-        section = objfile.get_section(section_name)
-        if section is None:
-            log.error("No such section for entrypoint (ignored): {}+0x{:x}".format(section_name, offset))
-            continue
-        addr = Addr(section, offset, name)
-        section.annotate(addr, 'manual-entrypoint', name)
-        debug(1, "Noting function entry point at {!r}".format(addr))
-        section.register_entry_point(addr, name=name)
-        if name:
-            debug(1, "Adding label for entrypoint at {!r}".format(addr))
-            section.add_label(addr, name)
+def filename_match(filename, template_filename):
+    if (os.sep + filename).endswith(os.sep + template_filename):
+        return True
+    if (os.sep + os.path.realpath(filename)).endswith(os.sep + template_filename):
+        return True
+    return False
+
+
+def generate_hash(filename):
+    hasher = hashlib.sha256()
+    with open(filename, 'rb') as f:
+        while True:
+            data = f.read(4096)
+            if not data:
+                break
+            hasher.update(data)
+    return hasher.hexdigest()
+
+
+class Fixups:
+    @classmethod
+    def load_from_file(cls, fixupfile_name, objfile_name):
+        import yaml
+
+        filehash = None
+        filename = os.path.normpath(objfile_name)
+        best_match = None
+        best_match_filename = ''
+        default_fixups = None
+
+        with open(fixupfile_name, 'r') as f:
+            for fixups in yaml.safe_load_all(f):
+                if not isinstance(fixups, dict):
+                    log.warning("Malformed fixups section in {} (skipped)".format(fixupfile_name))
+                    continue
+                fixups_filename = fixups.get('filename', '')
+                if fixups_filename:
+                    fixups_filename = os.path.normpath(fixups_filename)
+                fixups_filehash = fixups.get('filehash')
+                if fixups_filehash:
+                    if filehash is None:
+                        try:
+                            filehash = generate_hash(objfile_name)
+                        except (FileNotFoundError, IOError) as e:
+                            # If we can't read the source file, the program will
+                            # bomb out later anyway.  For now, just pick a value
+                            # that will never match.
+                            debug(1, 'load_fixups: Cannot read object file: {}'.format(e))
+                            filehash = False
+                    if filehash == fixups_filehash:
+                        if fixups_filename and not filename_match(filename, fixups_filename):
+                            debug(1, 'Note: Fixups found with matching filehash ({}), but filename does not match.  Using them anyway.'.format(fixups_filename))
+                        else:
+                            debug(2, 'Using fixups matching filehash ({}).'.format(fixups_filename))
+                        return cls(fixups)
+                    elif filename_match(filename, fixups_filename):
+                        debug(2, 'Found fixups with potentially matching filename ({}) but hash does not match.  Ignoring.'.format(fixups_filename))
+                elif fixups_filename:
+                    if filename_match(filename, fixups_filename):
+                        debug(2, 'Found fixups with potentially matching filename ({}).'.format(fixups_filename))
+                        if len(fixups_filename) > len(best_match_filename):
+                            best_match = fixups
+                            best_match_filename = fixups_filename
+                else:
+                    if default_fixups is None:
+                        default_fixups = fixups
+        if best_match:
+            debug(2, 'Using fixups with best filename match ({}).'.format(best_match['filename']))
+            return cls(best_match)
+        if default_fixups:
+            debug(2, 'No fixups filename or hash match.  Using default fixups entry.')
+            return cls(default_fixups)
+        debug(1, 'No appropriate fixups found in {!r} for input file {!r}'.format(fixupfile_name, filename))
+        return None
+
+    def __init__(self, rawdata):
+        self.rawdata = rawdata
+        self.name = rawdata.get('filename')
+        if not self.name:
+            self.name = rawdata.get('filehash', '(default)')
+
+    def __str__(self):
+        return self.name
+
+    def _addr_list(self, listname):
+        result = []
+        rawlist = self.rawdata.get(listname, [])
+        if not isinstance(rawlist, list):
+            rawlist = [rawlist]
+        for entry in rawlist:
+            if isinstance(entry, dict):
+                pass
+            elif isinstance(entry, (str, int)):
+                entry = {str(entry): ''}
+            else:
+                log.error("Malformed entry in {!r} list (YAML interpreted as {!r}).  Ignored.".format(listname, entry))
+                continue
+            result.extend(entry.items())
+        return result
+
+    @property
+    def symbols(self):
+        return self._addr_list('symbols')
+
+    @property
+    def entrypoints(self):
+        return self._addr_list('entrypoints')
+
+    @property
+    def data_locations(self):
+        return self._addr_list('data-locations')
+
+    @property
+    def annotations(self):
+        return self._addr_list('annotations')
+
+    def apply(self, objfile):
+        objfile.add_manual_symbols(self.symbols)
+        objfile.add_manual_entrypoints(self.entrypoints)
+        objfile.add_manual_datalocs(self.data_locations)
+        objfile.add_manual_annotations(self.annotations)
 
 
 class DumpWriter:
@@ -2451,7 +2830,7 @@ if __name__ == '__main__':
     parser.add_argument('filename', metavar='OBJFILE', type=str,
                        help='ELF object (.o) file to disassemble')
     parser.add_argument('--raw', metavar='OFFSET[:NAME]', type=str, help="Treat OBJFILE as a raw (not ELF) dump (assume it's loaded at start address OFFSET, and give it section name NAME in the disassembled output)")
-    parser.add_argument('--entry', metavar='ADDR[:NAME]', action='append', default=[], help='Treat ADDR as a function entry point (optionally named NAME)')
+    parser.add_argument('--entrypoint', metavar='ADDR[:NAME]', action='append', default=[], help='Treat ADDR as a function entry point (optionally named NAME)')
     parser.add_argument('--verbose', '-v', action='count', default=0,
                        help='Increase output verbosity (can be specified multiple times)')
     parser.add_argument('--quiet', '-q', action='count', default=0,
@@ -2462,10 +2841,21 @@ if __name__ == '__main__':
                        help='Do not print hex-dump comments on each line')
     parser.add_argument('--noopnotes', action='store_true',
                        help='Do not print comments about opcode arguments')
-    parser.add_argument('--callmap', metavar='MAPFILE', type=str, help='Write call-map data to MAPFILE')
-    parser.add_argument('--objdump', metavar='CMD', type=str, help='Full pathname of the objdump command to use')
+    parser.add_argument('--callmap', metavar='MAPFILE', type=str,
+                       help='Write call-map data to MAPFILE')
+    parser.add_argument('--objdump', metavar='CMD', type=str,
+                       help='Full pathname of the objdump command to use')
+    parser.add_argument('--fixups', metavar='FIXUPFILE', type=str,
+                       help='Load fixup info from FIXUPFILE')
+    parser.add_argument('--hash', action='store_true',
+                       help='Do not disassemble the file, just print its hash')
 
     args = parser.parse_args()
+
+    if args.hash:
+        print("filehash: {}".format(generate_hash(args.filename)))
+        sys.exit(0)
+
     if args.verbose:
         logging.root.setLevel(logging.DEBUG)
     elif args.quiet > 1:
@@ -2515,12 +2905,19 @@ if __name__ == '__main__':
         raw_offset = None
         raw_name = None
 
-    if args.entry:
-        for i in range(len(args.entry)):
-            try:
-                args.entry[i] = parse_addr_spec(args.entry[i], raw_name)
-            except ValueError:
-                log.error("Invalid address specified for --entry: {!r}".format(args.entry[i]))
+    if args.entrypoint:
+        for i in range(len(args.entrypoint)):
+            e = args.entrypoint[i].split(':', 2)
+            if len(e) < 2:
+                e.append('')
+            args.entrypoint[i] = e
+
+    fixups = None
+    if args.fixups:
+        try:
+            fixups = Fixups.load_from_file(args.fixups, args.filename)
+        except (FileNotFoundError, IOError) as e:
+            log.error("Unable to read fixups file {!r}: {}".format(args.fixups, e))
 
     info(1, "xtobjdump version {}".format(VERSION_STRING))
     info(1, "  objdump={}".format(args.objdump))
@@ -2531,6 +2928,8 @@ if __name__ == '__main__':
         info(1, "  raw=yes ({})".format(args.raw))
     else:
         info(1, "  raw=no")
+    info(1, "  fixups_file={}".format(args.fixups))
+    info(1, "  fixups={}".format(fixups))
     info(1, "Disassembling: {}".format(args.filename))
     info(1, "")
 
@@ -2542,7 +2941,7 @@ if __name__ == '__main__':
 
     with open(args.filename, 'rb') as f:
         if args.raw:
-            disassembler = RawObjdumpDisassembler(args.objdump)
+            disassembler = ObjdumpRawDisassembler(args.objdump, 'xtensa')
         else:
             try:
                 elf = ELFFile(f)
@@ -2559,17 +2958,19 @@ if __name__ == '__main__':
                 print_elf_info(elf)
                 debug(1, "=== Loading ELF Data...")
                 load_elf_data(objfile, elf)
-                debug(1, "=== Loading annotations from ELF file...")
-                load_elf_annotations(objfile, elf)
-            if args.entry:
-                debug(1, "=== Applying manual annotations...")
-                add_manual_entrypoints(objfile, args.entry)
+            debug(1, "=== Applying manual annotations from command line...")
+            objfile.add_manual_entrypoints(args.entrypoint)
+            if fixups:
+                debug(1, "=== Applying manual annotations from fixups file...")
+                fixups.apply(objfile)
+            debug(1, "=== Resolving annotations...")
+            objfile.resolve_annotations()
             debug(1, "=== Starting code analysis phase...")
             objfile.code_analysis()
             debug(1, "=== Starting data analysis phase...")
             objfile.data_analysis()
-            debug(1, "=== Starting fixup phase...")
-            objfile.fixup()
+            debug(1, "=== Starting cleanup phase...")
+            objfile.cleanup()
             debug(1, "=== Analysis complete.")
             dw.dump(objfile)
             if args.callmap:
