@@ -1118,6 +1118,8 @@ class FunctionRegion (Region):
 
     def dump(self, writer):
         writer.spacer_line()
+        writer.check_addr(self.start)
+        writer.comment('Function @ {}+0x{:x}'.format(self.start.section.name, self.start.offset))
         if len(self.stack.annotations) > 1:
             writer.comment('Local variables/stack:')
             for addr, note in self.stack.annotations.items():
@@ -2628,7 +2630,9 @@ class DumpWriter:
             self.emit_annotation(note_addr)
             self.nl += 1
 
-    def change_addr(self, addr):
+    def check_addr(self, addr):
+        if self.addr == addr:
+            return
         if self.addr > addr:
             self.spacer_line()
             log.warning("Apparently overlapping regions: New position {!r} is before current position {!r}".format(addr, self.addr))
@@ -2701,8 +2705,7 @@ class DumpWriter:
     def asm_line(self, addr, length, instr, argstr, output_hexdump=True):
         output_hexdump = output_hexdump and self.output_hexdump
         if addr is not None:
-            if self.addr != addr:
-                self.change_addr(addr)
+            self.check_addr(addr)
 
             while self.note_locs[self.nl] < addr:
                 note_addr = self.note_locs[self.nl]
