@@ -27,7 +27,7 @@ from elftools.common.py3compat import bytes2str, str2bytes
 from elftools.elf.constants import *
 from sortedcontainers import SortedDict
 
-VERSION_STRING = '0.6'
+VERSION_STRING = '0.7'
 
 OBJDUMP_ENV_VAR = 'XTOBJDIS_OBJDUMP'
 DEFAULT_OBJDUMP = 'xtensa-lx106-elf-objdump'
