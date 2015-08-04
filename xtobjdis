@@ -1455,7 +1455,7 @@ class Section:
             offset = offset.offset
         start = self.regions.iloc[self.regions.bisect(offset) - 1]
         region = self.regions[start]
-        if region.end.offset > offset:
+        if region.start.offset <= offset and region.end.offset > offset:
             return region
         return None
 
