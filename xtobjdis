@@ -752,18 +752,12 @@ class FunctionRegion (Region):
             if slot0_arg is not None:
                 if opcode.addr in section.slot_relocs:
                     slot, sym, addend = section.slot_relocs[opcode.addr]
-                    # In Xtensa, there shouldn't ever be a case where the symbol
-                    # used for the relocation is in a different segment (which
-                    # makes no sense), but check just to be sure.
-                    if sym.section != section:
-                        log.warning("Slot relocation at {!r} refers to a symbol in a different section!  Relocation ignored.".format(opcode.addr))
-                    else:
-                        old_argstr = opcode.argstr()
-                        addr = sym + addend
-                        # We only ever have SLOT0 fixups on Xtensa, so just
-                        # replace the first non-register arg.
-                        opcode.args[slot0_arg] = addr
-                        debug(3, "Applied SLOT0 relocation at {!r}.  Old opcode: '{} {}' New opcode: '{} {}'".format(opcode.addr, opcode.instr, old_argstr, opcode.instr, opcode.argstr()))
+                    old_argstr = opcode.argstr()
+                    addr = sym + addend
+                    # We only ever have SLOT0 fixups on Xtensa, so just
+                    # replace the first non-register arg.
+                    opcode.args[slot0_arg] = addr
+                    debug(3, "Applied SLOT0 relocation at {!r}.  Old opcode: '{} {}' New opcode: '{} {}'".format(opcode.addr, opcode.instr, old_argstr, opcode.instr, opcode.argstr()))
                 else:
                     # If slot0 wasn't updated with a relocation, try to
                     # determine what type of value it should be.
@@ -900,7 +894,8 @@ class FunctionRegion (Region):
                 value = None
                 if opcode_type == 'literal':
                     try:
-                        value = RegisterValue(self.section.get_word(opcode.args[1]))
+                        addr = opcode.args[1]
+                        value = RegisterValue(addr.section.get_word(addr))
                     except IndexError:
                         pass
                 elif opcode_type in ('load', 'store'):
@@ -1050,7 +1045,7 @@ class FunctionRegion (Region):
             if instr == 'l32r':
                 debug(3, "{!r}: annotating {!r} as literal data.".format(opcode.addr, opcode.args[1]))
                 addr = opcode.args[1]
-                self.section.register_literal(addr)
+                addr.section.register_literal(addr)
                 addr.section.annotate(addr, 'referenced_by', (opcode.addr, 'load'))
             elif opcode_type in ('load', 'store'):
                 if opcode.value:
