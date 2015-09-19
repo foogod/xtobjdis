@@ -1308,6 +1308,7 @@ class Section:
     flag_strings = False
     flag_group = False
     flag_tls = False
+    process_relocs = True
 
     def __init__(self, objfile, index, name, data):
         self.objfile = objfile
@@ -1791,6 +1792,8 @@ class BssSection (Section):
 
 
 class MetadataSection (Section):
+    process_relocs = False
+
     def code_analysis(self):
         pass
 
@@ -1847,6 +1850,8 @@ class XtPropSection (MetadataSection):
         addresses.  These relocation fixups are handled the same way as for any
         other section)
     """
+    process_relocs = True
+
     def __init__(self, objfile, index, name, data):
         MetadataSection.__init__(self, objfile, index, name, data)
         self.entries = []
@@ -1912,6 +1917,8 @@ class XtLitSection (MetadataSection):
         pointing to valid section+offset addresses.  These relocation fixups
         are handled the same way as for any other section)
     """
+    process_relocs = True
+
     def __init__(self, objfile, index, name, data):
         MetadataSection.__init__(self, objfile, index, name, data)
         self.entries = []
@@ -2379,6 +2386,9 @@ def load_elf_data(objfile, elf):
             section = objfile.get_section(section_name)
             if section is None:
                 log.warn("Cannot find section {!r}.  Ignoring relocations in {!r}".format(section_name, rel_section_name))
+                continue
+            elif not section.process_relocs:
+                debug(1, "Skipping relocations for {}...".format(section.name))
                 continue
             debug(1, "Processing relocations for {} ({})...".format(section.name, rel_section_name))
             for rel in elf_section.iter_relocations():
