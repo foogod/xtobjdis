@@ -895,7 +895,8 @@ class FunctionRegion (Region):
                 if opcode_type == 'literal':
                     try:
                         addr = opcode.args[1]
-                        value = RegisterValue(addr.section.get_word(addr))
+                        if addr.section:
+                            value = RegisterValue(addr.section.get_word(addr))
                     except IndexError:
                         pass
                 elif opcode_type in ('load', 'store'):
@@ -1045,8 +1046,9 @@ class FunctionRegion (Region):
             if instr == 'l32r':
                 debug(3, "{!r}: annotating {!r} as literal data.".format(opcode.addr, opcode.args[1]))
                 addr = opcode.args[1]
-                addr.section.register_literal(addr)
-                addr.section.annotate(addr, 'referenced_by', (opcode.addr, 'load'))
+                if addr.section:
+                    addr.section.register_literal(addr)
+                    addr.section.annotate(addr, 'referenced_by', (opcode.addr, 'load'))
             elif opcode_type in ('load', 'store'):
                 if opcode.value:
                     addr = opcode.value.ref.get_addr()
@@ -1499,8 +1501,7 @@ class Section:
                 end = Addr(self, len(self.data))
             debug(2, "Found new code region at {!r} - {!r}".format(start, end))
             region = FunctionRegion(start, end)
-            self.add_region(region)
-            changed = True
+            changed = self.add_region(region)
         for region in list(self.regions.values()):
             changed = region.code_analysis() or changed
             if region.start == region.end:
@@ -1617,20 +1618,24 @@ class Section:
                         dtype = 'bytes'
                         #self.annotate(addr, 'data_type', 'bytes')
 
-            if dtype == 4:
-                region = WordDataRegion(addr)
-            elif dtype == 2:
-                region = HalfWordDataRegion(addr)
-            elif dtype == 1:
-                region = BytesDataRegion(addr)
-            elif dtype == 'str':
-                region = AsciiDataRegion(addr, end)
-            else:
-                region = BytesDataRegion(addr, end)
+            try:
+                if dtype == 4:
+                    region = WordDataRegion(addr)
+                elif dtype == 2:
+                    region = HalfWordDataRegion(addr)
+                elif dtype == 1:
+                    region = BytesDataRegion(addr)
+                elif dtype == 'str':
+                    region = AsciiDataRegion(addr, end)
+                else:
+                    region = BytesDataRegion(addr, end)
 
-            debug(1, "Identified {} region at {!r}".format(region.region_type, addr))
-            self.add_region(region)
-            changed = True
+                debug(1, "Identified {} region at {!r}".format(region.region_type, addr))
+                self.add_region(region)
+                changed = True
+            except IndexError:
+                log.warning("Apparent reference to area outside of segment data ({!r} referenced by {}".format(addr, ann.get('referenced_by', '(unknown)')))
+
         return changed
 
     def find_new_data_regions(self):
@@ -2269,6 +2274,18 @@ class ObjdumpDisassembler:
                 continue
             m = self.line_re.match(line)
             if not m:
+                if not line:
+                    # Blank lines are not normally expected, but are OK
+                    continue
+                if self.start_re.match(line):
+                    # The disassembler is reporting a symbol which points to
+                    # somewhere inside what we're disassembling.  This
+                    # shouldn't normally happen, but can happen in the case of
+                    # some assmbly-coded stuff, and isn't really a problem.
+                    # The symbol's location should already have been noted by
+                    # other parts of xtobjdis, so we can just quietly ignore
+                    # this.
+                    continue
                 log.warn("Unrecognized line in disassembly output: {!r}".format(line))
                 continue
             op = list(m.groups())
