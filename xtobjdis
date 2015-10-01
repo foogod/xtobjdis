@@ -399,6 +399,9 @@ class Opcode:
     def argstr(self):
         return ', '.join(str(a) for a in self.args)
 
+    def tostr(self):
+        return self.instr + ' ' + self.argstr()
+
     def hexdata(self):
         return ''.join('{:02x}'.format(b) for b in self.data)
 
@@ -668,6 +671,9 @@ class Region:
     def adjust_end(self, end):
         self.end = end
 
+    def rewrite(self, rewrite_opts):
+        pass
+
     def dump(self, writer):
         # We shouldn't ever get here, because nobody should be creating a
         # direct instance of Region, and all subclasses should be overriding
@@ -909,6 +915,9 @@ class FunctionRegion (Region):
                         value = regs.get(value)
                     else:
                         value = RegisterValue(value)
+                elif instr == 'or' and opcode.args[1] == opcode.args[2]:
+                    # This is effectively the same as a mov
+                    value = regs.get(opcode.args[1])
                 elif instr in ('addi', 'addmi'):
                     value = regs.get(opcode.args[1])
                     if value:
@@ -1113,10 +1122,74 @@ class FunctionRegion (Region):
         if prev_addr:
             self.stack.annotate(prev_addr, 'length', -prev_addr.offset)
 
+    def rewrite(self, rewrite_opts):
+        if rewrite_opts.get('remove_dotn'):
+            for opcode in self.disassembly:
+                if opcode.instr.endswith('.n'):
+                    debug(2, "Rewrite: {!r}: changing {!r} to {!r}".format(opcode.addr, opcode.instr, opcode.instr[:-2]))
+                    opcode.instr = opcode.instr[:-2]
+        if rewrite_opts.get('sr_as_arg'):
+            for opcode in self.disassembly:
+                instr = opcode.instr.split('.')
+                if instr[0] in ('rsr', 'wsr', 'xsr'):
+                    old_instr = opcode.tostr()
+                    opcode.instr = instr[0]
+                    opcode.args.append(instr[1])
+                    debug(2, "Rewrite: {!r}: changing {!r} to {!r}".format(opcode.addr, old_instr, opcode.tostr()))
+        if rewrite_opts.get('a1_as_sp'):
+            for opcode in self.disassembly:
+                for i in range(len(opcode.args)):
+                    debug(2, "Rewrite: {!r}: changing a1 to sp".format(opcode.addr))
+                    if opcode.args[i] == 'a1':
+                        opcode.args[i] = 'sp'
+        if rewrite_opts.get('or_as_mov'):
+            for opcode in self.disassembly:
+                if opcode.instr == 'or' and opcode.args[1] == opcode.args[2]:
+                    # There is technically no (non-narrow) "mov r1, r2"
+                    # instruction in Xtensa.  Instead, this construct in the
+                    # source is actually assembled down as an "or r1, r2, r2"
+                    # instruction (which has the same effect).  Rewrite this
+                    # back to a "mov" for clarity.
+                    opcode.instr = 'mov'
+                    del opcode.args[2]
+        if rewrite_opts.get('inline_literals'):
+            i = 0
+            while i < len(self.disassembly):
+                opcode = self.disassembly[i]
+                if opcode.instr == 'l32r':
+                    # We're going to be converting this to an inline literal,
+                    # which means it won't refer to the l32r target anymore.
+                    # Make sure we update the annotation on the target to
+                    # reflect this.
+                    ref = opcode.args[1]
+                    self.section.remove_annotation(ref, 'referenced_by', (opcode.addr, 'load'))
+                    try:
+                        next_opcode = self.disassembly[i + 1]
+                    except IndexError:
+                        next_opcode = opcode
+                    if opcode.args[0] == 'a0' and next_opcode.instr == 'callx0' and next_opcode.args[0] == 'a0':
+                        # 'l32r a0, <ref>' followed by 'callx0 a0' is a common
+                        # idiom, and is directly replaceable with a single
+                        # 'call0 <dest>' instead
+                        del self.disassembly[i]
+                        next_opcode.addr = opcode.addr
+                        next_opcode.length += opcode.length
+                        next_opcode.instr = 'call0'
+                        next_opcode.args = [next_opcode.value]
+                        next_opcode.notes = []
+                        i -= 1
+                        debug(2, "Rewrite: {!r}: changing 'l32r'+'callx0' to 'call0'".format(opcode.addr))
+                        continue
+                    opcode.instr = 'movi'
+                    opcode.args[1] = opcode.value
+                    if opcode.notes == [str(opcode.value)]:
+                        opcode.notes = []
+                    debug(2, "Rewrite: {!r}: changing 'l32r' to 'movi'".format(opcode.addr))
+                i += 1
+
     def dump(self, writer):
         writer.spacer_line()
-        writer.check_addr(self.start)
-        writer.comment('Function @ {}+0x{:x}'.format(self.start.section.name, self.start.offset))
+        writer.start_function(self.start)
         if len(self.stack.annotations) > 1:
             writer.comment('Local variables/stack:')
             for addr, note in self.stack.annotations.items():
@@ -1141,6 +1214,19 @@ class FunctionRegion (Region):
 
 class DataRegion (Region):
     region_type = "data"
+
+
+class LiteralPositionRegion (DataRegion):
+    region_type = "literal-position"
+
+    def __init__(self, start, end=None):
+        if end is None:
+            end = start + 4
+        Region.__init__(self, start, end)
+
+    def dump(self, writer):
+        size = self.end - self.start
+        writer.asm_line(self.start, size, '.literal_position', '', check_addr=False)
 
 
 class BytesDataRegion (DataRegion):
@@ -1670,6 +1756,40 @@ class Section:
         end = self.regions.iloc[self.regions.bisect(start.offset)]
         return end - start
 
+    def rewrite(self, rewrite_opts):
+        debug(1, "Rewriting section {}".format(self.name))
+        for r in self.regions.values():
+            r.rewrite(rewrite_opts)
+        if rewrite_opts.get('inline_literals'):
+            region_addrs = list(self.regions.keys())
+            prev_r = None
+            for addr in region_addrs:
+                r = self.regions[addr]
+                if isinstance(r, WordDataRegion):
+                    ann = self.annotations.get(r.start, {})
+                    if ann.get('type') == {'data'} and 'literal' in ann.get('ref', []):
+                        # It's a word literal or reloc target.  Is it
+                        # referenced by anything after we've replaced all the
+                        # 'l32r's?
+                        if ann.get('referenced_by'):
+                            debug(2, "Rewrite: {!r}: literal data found, but still has referrers.  Not changing.".format(r.start))
+                            continue
+                        # As expected, nothing left explicitly referring to
+                        # this.  Replace it with a '.literal_position'
+                        # directive instead.
+                        debug(2, "Rewrite: {!r}: changing data word to .literal_position".format(r.start))
+                        # Since there's nothing referencing this, no need for a
+                        # label anymore.
+                        ann['label'] = set()
+                        if isinstance(prev_r, LiteralPositionRegion):
+                            debug(3, "Merging {!r} with previous .literal_position".format(r.start))
+                            del self.regions[addr]
+                            prev_r.end = r.end
+                            continue
+                        else:
+                            self.regions[addr] = LiteralPositionRegion(r.start)
+                prev_r = self.regions[addr]
+
     def cleanup(self):
         debug(1, "Applying cleanups for section {}".format(self.name))
         offset = 0
@@ -1761,6 +1881,8 @@ class Section:
 
 
     def dump(self, writer):
+        if not self.regions and not writer.output_empty_sections:
+            return
         writer.start_section(self)
         for r in self.regions.values():
             r.dump(writer)
@@ -1998,6 +2120,10 @@ class ObjectFile:
         self.generate_labels()
         for section in self.sections.values():
             section.cleanup()
+
+    def rewrite(self, rewrite_opts):
+        for section in self.sections.values():
+            section.rewrite(rewrite_opts)
 
     def generate_labels(self):
         current_counters = {}
@@ -2607,12 +2733,22 @@ class DumpWriter:
         'SHT_PREINIT_ARRAY': '@preinit_array',
     }
 
+    symbol_type_map = {
+        'STT_FUNC': '@function',
+        'STT_GNU_IFUNC': '@gnu_indirect_function',
+        'STT_OBJECT': '@object',
+        'STT_TLS': '@tls_object',
+        'STT_COMMON': '@common',
+    }
+
     def __init__(self, outfile):
         self.outfile = outfile
         self.output_annotations = False
         self.output_hexdump = True
         self.output_opcode_notes = True
-        self.asmline_fmt = "{:11} {:12} {:37} {}"
+        self.output_empty_sections = False
+        self.line_fmt = "{:62} {}"
+        self.asmline_fmt = "{:11} {:12} {}"
         self.data_comment_fmt = "# {:>4x}: {}"
         self.label_width = 11
         self.hexdata_chunk_size = 4
@@ -2652,9 +2788,13 @@ class DumpWriter:
             self.emit_annotation(note_addr)
             self.nl += 1
 
+    def start_function(self, addr):
+        self.check_addr(addr)
+        self.comment('Function @ {}+0x{:x}'.format(addr.section.name, addr.offset))
+
     def check_addr(self, addr):
         if self.addr == addr:
-            return
+            return True
         if self.addr > addr:
             self.spacer_line()
             log.warning("Apparently overlapping regions: New position {!r} is before current position {!r}".format(addr, self.addr))
@@ -2685,6 +2825,7 @@ class DumpWriter:
                 self.spacer_line()
                 self.asm_line(None, 0, '.skip', str(addr - self.addr))
         self.addr = addr
+        return False
 
     def output_line(self, text, spacers=True):
         if spacers:
@@ -2701,7 +2842,15 @@ class DumpWriter:
     def spacer_line(self, count=1):
         self.spacer_lines = max(self.spacer_lines, count)
 
+    def pre_emit_label(self, label, addr=None):
+        sym = self.objfile.get_symbol(str(label))
+        if sym:
+            self.asm_line(None, 0, '.global', label)
+            symtype = self.symbol_type_map.get(sym.type, sym.type)
+            self.asm_line(None, 0, '.type', "{}, {}".format(label, symtype))
+
     def emit_label(self, label, addr=None):
+        self.pre_emit_label(label, addr)
         if addr is None or addr == self.addr:
             # Label corresponds to our current position.  Nothing special to do
             # here.
@@ -2709,12 +2858,12 @@ class DumpWriter:
         elif addr < self.addr:
             # Oops.. we missed it because an instruction (or something) took us
             # past the label's address.
-            self.output_line(self.asmline_fmt.format(label, '=', '.-{}  ### WARNING: label not on instruction boundary!'.format(self.addr - addr), ''))
+            self.output_line(self.asmline_fmt.format(label, '=', '.-{}  ### WARNING: label not on instruction boundary!'.format(self.addr - addr)))
         else:
             # This label is somewhere ahead of where we are.  Assume we're
             # being called because we're skipping past its location, so we need
             # to print it out now.  Just print an absolute address for this.
-            self.output_line(self.asmline_fmt.format(label, '=', '0x{:x}'.format(addr.offset), ''))
+            self.output_line(self.asmline_fmt.format(label, '=', '0x{:x}'.format(addr.offset)))
 
     def emit_annotation(self, addr):
         if not self.output_annotations:
@@ -2724,10 +2873,11 @@ class DumpWriter:
             value = ', '.join(sorted(str(a) for a in ann[key]))
             self.output_line("# Ann: {:x}: {} = {}".format(addr.offset, key, value))
 
-    def asm_line(self, addr, length, instr, argstr, output_hexdump=True):
+    def asm_line(self, addr, length, instr, argstr, output_hexdump=True, check_addr=True):
         output_hexdump = output_hexdump and self.output_hexdump
         if addr is not None:
-            self.check_addr(addr)
+            if check_addr:
+                self.check_addr(addr)
 
             while self.note_locs[self.nl] < addr:
                 note_addr = self.note_locs[self.nl]
@@ -2744,6 +2894,7 @@ class DumpWriter:
                     for label in labels[:-1]:
                         self.emit_label(label, note_addr)
                     label = labels[-1] + ':'
+                    self.pre_emit_label(labels[-1], note_addr)
                 self.nl += 1
             if output_hexdump:
                 data = self.section.data[addr:addr + min(length, self.hexdata_chunk_size)]
@@ -2757,14 +2908,15 @@ class DumpWriter:
         if len(label) > self.label_width:
             self.output_line(label)
             label = ''
-        self.output_line(self.asmline_fmt.format(label, instr, argstr, comment))
+        asmline = self.asmline_fmt.format(label, instr, argstr)
+        self.output_line(self.line_fmt.format(asmline, comment))
         if output_hexdump and length > self.hexdata_chunk_size:
             data = self.section.data[addr:addr + length]
             for i in range(self.hexdata_chunk_size, length, self.hexdata_chunk_size):
                 chunk = data[i:min(i + self.hexdata_chunk_size, length)]
                 hexdata = ''.join('{:02x}'.format(b) for b in chunk)
                 comment = self.data_comment_fmt.format(addr.offset + i, hexdata)
-                self.output_line(self.asmline_fmt.format('', '', '', comment))
+                self.output_line(self.line_fmt.format('', comment))
         if addr is not None:
             self.addr = addr + length
 
@@ -2866,6 +3018,8 @@ if __name__ == '__main__':
                        help='Do not print hex-dump comments on each line')
     parser.add_argument('--noopnotes', action='store_true',
                        help='Do not print comments about opcode arguments')
+    parser.add_argument('--empty-sections', action='store_true',
+                       help='Print a .section entry even for sections with no contents')
     parser.add_argument('--callmap', metavar='MAPFILE', type=str,
                        help='Write call-map data to MAPFILE')
     parser.add_argument('--objdump', metavar='CMD', type=str,
@@ -2874,6 +3028,18 @@ if __name__ == '__main__':
                        help='Load fixup info from FIXUPFILE')
     parser.add_argument('--hash', action='store_true',
                        help='Do not disassemble the file, just print its hash')
+    parser.add_argument('--rewrite-inline-literals', action='store_true',
+                       help='Represent literals directly in movi/call0/etc instead of using l32r')
+    parser.add_argument('--rewrite-remove-dotn', action='store_true',
+                       help='Strip trailing ".n" from narrow opcodes')
+    parser.add_argument('--rewrite-sr-as-arg', action='store_true',
+                       help='Represent the special register as a second argument to RSR/WSR/XSR instead of part of the instruction name')
+    parser.add_argument('--rewrite-or-as-mov', action='store_true',
+                       help="Represent 'or r1, r2, r2' as 'mov r1, r2' instead")
+    parser.add_argument('--rewrite-a1-as-sp', action='store_true',
+                       help="Represent register a1 using its alternate name of 'sp'")
+    parser.add_argument('--rewrite-as-source', action='store_true',
+                       help="Apply all common formatting idioms to make the result more source-code-like (equivalent to '--rewrite-inline-literals --rewrite-remove-dotn --rewrite-sr-as-arg --rewrite-or-as-mov --rewrite-a1-as-sp')")
 
     args = parser.parse_args()
 
@@ -2943,11 +3109,25 @@ if __name__ == '__main__':
             fixups = Fixups.load_from_file(args.fixups, args.filename)
         except (FileNotFoundError, IOError) as e:
             log.error("Unable to read fixups file {!r}: {}".format(args.fixups, e))
+    rewrite_opts = {
+        'inline_literals': args.rewrite_inline_literals,
+        'remove_dotn': args.rewrite_remove_dotn,
+        'sr_as_arg': args.rewrite_sr_as_arg,
+        'a1_as_sp': args.rewrite_a1_as_sp,
+        'or_as_mov': args.rewrite_or_as_mov,
+    }
+    if args.rewrite_as_source:
+        rewrite_opts['inline_literals'] = True
+        rewrite_opts['remove_dotn'] = True
+        rewrite_opts['sr_as_arg'] = True
+        rewrite_opts['a1_as_sp'] = True
+        rewrite_opts['or_as_mov'] = True
 
     info(1, "xtobjdump version {}".format(VERSION_STRING))
     info(1, "  objdump={}".format(args.objdump))
     info(1, "  hexdump={}".format(not args.nohex))
     info(1, "  opnotes={}".format(not args.noopnotes))
+    info(1, "  empty_sections={}".format(not args.empty_sections))
     info(1, "  annotations={}".format(args.annotations))
     if args.raw:
         info(1, "  raw=yes ({})".format(args.raw))
@@ -2961,8 +3141,8 @@ if __name__ == '__main__':
     dw = DumpWriter(sys.stdout)
     dw.output_hexdump = not args.nohex
     dw.output_opcode_notes = not args.noopnotes
-    if args.annotations:
-        dw.output_annotations = True
+    dw.output_empty_sections = bool(args.empty_sections)
+    dw.output_annotations = bool(args.annotations)
 
     with open(args.filename, 'rb') as f:
         if args.raw:
@@ -2996,6 +3176,8 @@ if __name__ == '__main__':
             objfile.data_analysis()
             debug(1, "=== Starting cleanup phase...")
             objfile.cleanup()
+            debug(1, "=== Starting rewriting phase...")
+            objfile.rewrite(rewrite_opts)
             debug(1, "=== Analysis complete.")
             dw.dump(objfile)
             if args.callmap:
