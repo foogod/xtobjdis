@@ -772,8 +772,10 @@ class FunctionRegion (Region):
                         # label, which the disassembler writes as just the
                         # address (base 16), so convert it to an Addr in the
                         # same section with that offset.
-                        addr = opcode.args[slot0_arg]
-                        addr = Addr(section, int(addr, 16))
+                        value = int(opcode.args[slot0_arg], 16)
+                        if value > 0x7fffffff:
+                            value -= 0x100000000
+                        addr = Addr(section, value)
                         opcode.args[slot0_arg] = addr
                     else:
                         # If it's not a branch/call/l32r, and wasn't relocated,
@@ -1157,6 +1159,9 @@ class FunctionRegion (Region):
             while i < len(self.disassembly):
                 opcode = self.disassembly[i]
                 if opcode.instr == 'l32r':
+                    if opcode.value is None:
+                        i += 1
+                        continue
                     # We're going to be converting this to an inline literal,
                     # which means it won't refer to the l32r target anymore.
                     # Make sure we update the annotation on the target to
