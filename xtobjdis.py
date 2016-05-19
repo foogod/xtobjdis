@@ -749,8 +749,14 @@ class FunctionRegion (Region):
                 opcode_marker = section.find_next_annotation(opcode_marker, 'opcode') or end
             elif opcode.addr + opcode.length > opcode_marker:
                 debug(2, "Opcode at {!r} overlaps 'opcode' annotation at {!r}.  Resynchronizing disassembly.".format(opcode.addr, opcode_marker))
-                for i in range(opcode.addr.offset, opcode_marker.offset):
-                    disassembly.append(Opcode(Addr(section, i), 1, '.byte', ['0x{:02x}'.format(section.data[i])]))
+                if section.data[opcode.addr.offset] == 0 and section.data[opcode_marker.offset - 1] == 0:
+                    # looks to be padding (zeros).  Use '.skip' opcode to
+                    # indicate this.
+                    skip = opcode_marker.offset - opcode.addr.offset
+                    disassembly.append(Opcode(opcode.addr, skip, '.skip', [str(skip)]))
+                else:
+                    for i in range(opcode.addr.offset, opcode_marker.offset):
+                        disassembly.append(Opcode(Addr(section, i), 1, '.byte', ['0x{:02x}'.format(section.data[i])]))
                 flush(generator)
                 generator = section.objfile.disassemble(opcode_marker, end)
                 opcode_marker = section.find_next_annotation(opcode_marker, 'opcode') or end
@@ -1152,6 +1158,15 @@ class FunctionRegion (Region):
                 if opcode.instr.endswith('.n'):
                     debug(2, "Rewrite: {!r}: changing {!r} to {!r}".format(opcode.addr, opcode.instr, opcode.instr[:-2]))
                     opcode.instr = opcode.instr[:-2]
+        if rewrite_opts.get('remove_padding'):
+            disassembly = []
+            for opcode in self.disassembly:
+                if opcode.instr == '.skip':
+                    if disassembly:
+                        disassembly[-1].length += opcode.length
+                else:
+                    disassembly.append(opcode)
+            self.disassembly = disassembly
         if rewrite_opts.get('sr_as_arg'):
             for opcode in self.disassembly:
                 instr = opcode.instr.split('.')
@@ -3032,35 +3047,37 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='xtobjdis', description='ELF object file disassembler for the Xtensa ISA')
     parser.add_argument('--version', action='version', version='%(prog)s {}'.format(VERSION_STRING))
     parser.add_argument('filename', metavar='OBJFILE', type=str,
-                       help='ELF object (.o) file to disassemble')
+                       help="ELF object (.o) file to disassemble")
     parser.add_argument('--raw', metavar='OFFSET[:NAME]', type=str, help="Treat OBJFILE as a raw (not ELF) dump (assume it's loaded at start address OFFSET, and give it section name NAME in the disassembled output)")
-    parser.add_argument('--entrypoint', metavar='ADDR[:NAME]', action='append', default=[], help='Treat ADDR as a function entry point (optionally named NAME)')
+    parser.add_argument('--entrypoint', metavar='ADDR[:NAME]', action='append', default=[], help="Treat ADDR as a function entry point (optionally named NAME)")
     parser.add_argument('--verbose', '-v', action='count', default=0,
-                       help='Increase output verbosity (can be specified multiple times)')
+                       help="Increase output verbosity (can be specified multiple times)")
     parser.add_argument('--quiet', '-q', action='count', default=0,
-                       help='Do not print info messages (use twice to also suppress warnings)')
+                       help="Do not print info messages (use twice to also suppress warnings)")
     parser.add_argument('--annotations', '-a', action='count', default=0,
-                       help='Add detailed annotation comments to assembly output')
+                       help="Add detailed annotation comments to assembly output")
     parser.add_argument('--nohex', action='store_true',
-                       help='Do not print hex-dump comments on each line')
+                       help="Do not print hex-dump comments on each line")
     parser.add_argument('--noopnotes', action='store_true',
-                       help='Do not print comments about opcode arguments')
+                       help="Do not print comments about opcode arguments")
     parser.add_argument('--empty-sections', action='store_true',
-                       help='Print a .section entry even for sections with no contents')
+                       help="Print a .section entry even for sections with no contents")
     parser.add_argument('--callmap', metavar='MAPFILE', type=str,
-                       help='Write call-map data to MAPFILE')
+                       help="Write call-map data to MAPFILE")
     parser.add_argument('--objdump', metavar='CMD', type=str,
-                       help='Full pathname of the objdump command to use')
+                       help="Full pathname of the objdump command to use")
     parser.add_argument('--fixups', metavar='FIXUPFILE', type=str,
-                       help='Load fixup info from FIXUPFILE')
+                       help="Load fixup info from FIXUPFILE")
     parser.add_argument('--hash', action='store_true',
-                       help='Do not disassemble the file, just print its hash')
+                       help="Do not disassemble the file, just print its hash")
     parser.add_argument('--rewrite-inline-literals', action='store_true',
-                       help='Represent literals directly in movi/call0/etc instead of using l32r')
+                       help="Represent literals directly in movi/call0/etc instead of using l32r")
     parser.add_argument('--rewrite-remove-dotn', action='store_true',
-                       help='Strip trailing ".n" from narrow opcodes')
+                       help="Strip trailing '.n' from narrow opcodes")
+    parser.add_argument('--rewrite-remove-padding', action='store_true',
+                       help="Remove '.skip' padding following jumps, etc")
     parser.add_argument('--rewrite-sr-as-arg', action='store_true',
-                       help='Represent the special register as a second argument to RSR/WSR/XSR instead of part of the instruction name')
+                       help="Represent the special register as a second argument to RSR/WSR/XSR instead of part of the instruction name")
     parser.add_argument('--rewrite-or-as-mov', action='store_true',
                        help="Represent 'or r1, r2, r2' as 'mov r1, r2' instead")
     parser.add_argument('--rewrite-a1-as-sp', action='store_true',
@@ -3139,6 +3156,7 @@ if __name__ == '__main__':
     rewrite_opts = {
         'inline_literals': args.rewrite_inline_literals,
         'remove_dotn': args.rewrite_remove_dotn,
+        'remove_padding': args.rewrite_remove_padding,
         'sr_as_arg': args.rewrite_sr_as_arg,
         'a1_as_sp': args.rewrite_a1_as_sp,
         'or_as_mov': args.rewrite_or_as_mov,
@@ -3146,6 +3164,7 @@ if __name__ == '__main__':
     if args.rewrite_as_source:
         rewrite_opts['inline_literals'] = True
         rewrite_opts['remove_dotn'] = True
+        rewrite_opts['remove_padding'] = True
         rewrite_opts['sr_as_arg'] = True
         rewrite_opts['a1_as_sp'] = True
         rewrite_opts['or_as_mov'] = True
