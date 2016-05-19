@@ -27,7 +27,7 @@ from elftools.common.py3compat import bytes2str, str2bytes
 from elftools.elf.constants import *
 from sortedcontainers import SortedDict
 
-VERSION_STRING = '0.7'
+VERSION_STRING = '0.8'
 
 OBJDUMP_ENV_VAR = 'XTOBJDIS_OBJDUMP'
 DEFAULT_OBJDUMP = 'xtensa-lx106-elf-objdump'
@@ -710,6 +710,12 @@ class FunctionRegion (Region):
         # point of the routine.
         disassembly, branch_dests = self._get_disassembly(self.start, self.end)
 
+        # Check for problems in the resulting disassembly which we might be
+        # able to fix up with another (more informed) run
+        if self._check_disassembly(disassembly, branch_dests):
+            debug(2, "Re-running disassembly based on new information...")
+            disassembly, branch_dests = self._get_disassembly(self.start, self.end)
+
         if disassembly:
             # Next, go through and try to determine the values of the registers at
             # each point.
@@ -837,6 +843,22 @@ class FunctionRegion (Region):
                 branch_dests[addr] = i
 
         return (disassembly, branch_dests)
+
+    def _check_disassembly(self, disassembly, branch_dests):
+        changed = False
+
+        # Find misaligned branch dests
+        dests = sorted(branch_dests.keys())
+        for opcode in disassembly:
+            while dests and opcode.addr >= dests[0]:
+                dests.pop(0)
+            if not dests:
+                break
+            if opcode.addr + opcode.length > dests[0]:
+                debug(3, "Found misaligned branch target at {!r}.  Annotating as opcode.".format(dests[0]))
+                self.section.annotate(dests[0], 'opcode', True)
+                changed = True
+        return changed
 
     def _resolve_regs(self, disassembly, branch_dests):
         # This is the real core of the static code analysis.  We go through
